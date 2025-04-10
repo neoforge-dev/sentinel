@@ -94,6 +94,26 @@ class TestResult(BaseModel):
     token_count: int
 
 
+# Function to store test results
+def store_test_result(result: TestResult) -> str:
+    """Store a test result and return its ID"""
+    result_id = result.id
+    test_results[result_id] = result
+    return result_id
+
+
+# Function to retrieve a stored test result
+def get_test_result(result_id: str) -> Optional[TestResult]:
+    """Get a test result by ID"""
+    return test_results.get(result_id)
+
+
+# Function to list all stored test result IDs
+def list_test_results() -> List[str]:
+    """List all test result IDs"""
+    return list(test_results.keys())
+
+
 def clean_test_output(output: str) -> str:
     """Clean test output to make it more readable"""
     # Remove ANSI escape sequences
@@ -299,13 +319,13 @@ async def run_tests_local(config: TestExecutionConfig) -> TestResult:
             token_count=count_tokens(details)
         )
         
-        # Store result
-        test_results[result_id] = test_result
+        # Store result using the store_test_result function
+        store_test_result(test_result)
         
         return test_result
     
     except subprocess.TimeoutExpired:
-        return TestResult(
+        test_result = TestResult(
             id=result_id,
             status="timeout",
             summary="Test execution timed out",
@@ -315,8 +335,10 @@ async def run_tests_local(config: TestExecutionConfig) -> TestResult:
             command=" ".join(cmd),
             token_count=0
         )
+        store_test_result(test_result)
+        return test_result
     except Exception as e:
-        return TestResult(
+        test_result = TestResult(
             id=result_id,
             status="error",
             summary=f"Error running tests: {str(e)}",
@@ -326,6 +348,8 @@ async def run_tests_local(config: TestExecutionConfig) -> TestResult:
             command=" ".join(cmd),
             token_count=0
         )
+        store_test_result(test_result)
+        return test_result
 
 
 async def run_tests_docker(config: TestExecutionConfig) -> TestResult:
@@ -412,6 +436,8 @@ async def run_tests_docker(config: TestExecutionConfig) -> TestResult:
                 command=" ".join(cmd),
                 token_count=count_tokens(details)
             )
+            store_test_result(test_result)
+            
         except Exception as e:
             container.stop()
             raise e
@@ -419,13 +445,10 @@ async def run_tests_docker(config: TestExecutionConfig) -> TestResult:
             # Cleanup
             container.remove()
         
-        # Store result
-        test_results[result_id] = test_result
-        
         return test_result
     
     except ImportError:
-        return TestResult(
+        test_result = TestResult(
             id=result_id,
             status="error",
             summary="Docker Python package not installed",
@@ -435,8 +458,10 @@ async def run_tests_docker(config: TestExecutionConfig) -> TestResult:
             command="",
             token_count=0
         )
+        store_test_result(test_result)
+        return test_result
     except Exception as e:
-        return TestResult(
+        test_result = TestResult(
             id=result_id,
             status="error",
             summary=f"Error running tests in Docker: {str(e)}",
@@ -446,6 +471,8 @@ async def run_tests_docker(config: TestExecutionConfig) -> TestResult:
             command="",
             token_count=0
         )
+        store_test_result(test_result)
+        return test_result
 
 
 @app.get("/")

@@ -19,8 +19,8 @@ from agents.mcp_test_server import (
     TestResult,
     TestRunner,
     ExecutionMode,
-    run_tests_locally,
-    run_tests_in_docker
+    run_tests_local,
+    run_tests_docker
 )
 
 
@@ -97,8 +97,8 @@ def test_run_tests_endpoint(mock_store, mock_popen, mock_process):
 
 @patch("agents.mcp_test_server.subprocess.Popen")
 @patch("agents.mcp_test_server.store_test_result")
-def test_run_tests_locally(mock_store, mock_popen, mock_process):
-    """Test the run_tests_locally function"""
+def test_run_tests_local(mock_store, mock_popen, mock_process):
+    """Test the run_tests_local function"""
     mock_popen.return_value = mock_process
     mock_store.return_value = "test-id-123"
     
@@ -109,7 +109,7 @@ def test_run_tests_locally(mock_store, mock_popen, mock_process):
         max_failures=1
     )
     
-    result = run_tests_locally(config)
+    result = run_tests_local(config)
     
     # Verify the result
     assert result.status == "failure"  # Because we mocked a failing test
@@ -121,8 +121,8 @@ def test_run_tests_locally(mock_store, mock_popen, mock_process):
 
 @patch("agents.mcp_test_server.docker.from_env")
 @patch("agents.mcp_test_server.store_test_result")
-def test_run_tests_in_docker(mock_store, mock_docker):
-    """Test the run_tests_in_docker function"""
+def test_run_tests_docker(mock_store, mock_docker):
+    """Test the run_tests_docker function"""
     # Mock the Docker container
     mock_container = MagicMock()
     mock_container.logs.return_value = (
@@ -155,7 +155,7 @@ def test_run_tests_in_docker(mock_store, mock_docker):
         docker_image="python:3.9"
     )
     
-    result = run_tests_in_docker(config)
+    result = run_tests_docker(config)
     
     # Verify the result
     assert result.status == "failure"  # Because we mocked a failing test
