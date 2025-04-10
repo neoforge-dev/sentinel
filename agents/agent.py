@@ -50,7 +50,7 @@ logging.basicConfig(
 logger = logging.getLogger("neo-agent")
 
 # Constants
-DEFAULT_MODEL = "mistral:7b"
+DEFAULT_MODEL = "mistral:7b-instruct"
 DEEPSEEK_MODEL = "deepseek-r1:32b"
 DEFAULT_MCP_URL = "http://localhost:8080"
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
@@ -60,7 +60,7 @@ RETRY_MAX_WAIT = 30
 
 # Model-specific settings
 MODEL_SETTINGS = {
-    "mistral:7b": {
+    "mistral:7b-instruct": {
         "temperature": 0.7,
         "max_tokens": 2048,
         "top_p": 0.9,
@@ -571,7 +571,7 @@ class OllamaAgent:
         
         while True:
             try:
-                user_input = input(f"\n{colorama.Fore.CYAN}👤 You: {colorama.Style.RESET_ALL}")
+                user_input = input(f"\n{colorama.Fore.CYAN}👤 -> {colorama.Style.RESET_ALL}")
                 if user_input.lower() in ["exit", "quit"]:
                     break
                 
@@ -661,7 +661,7 @@ class OllamaAgent:
                 print(f"\n{colorama.Fore.GREEN}🤖 Agent: {colorama.Style.RESET_ALL}", end="", flush=True)
                 
                 # Process with progress indicator for long responses
-                with tqdm(total=100, desc="Thinking", bar_format="{desc}: {bar}| {percentage:3.0f}%") as pbar:
+                with tqdm(total=100, desc="💭Thinking", bar_format="{desc}: {bar}| {percentage:3.0f}%") as pbar:
                     response = self.generate(prompt)
                     # Simulate progress for UX
                     for _ in range(4):
