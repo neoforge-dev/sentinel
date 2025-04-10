@@ -1,159 +1,144 @@
 # BaseAgent: Ollama + UV + MCP Integration
 
 A powerful AI project that combines:
-- [Ollama](https://github.com/ollama/ollama) for running local LLMs (DeepSeek-R1:32B and Mistral 7B)
-- [UV](https://github.com/astral-sh/uv) for Python dependency management and single-file agents
-- [MCP](https://github.com/microsoft/mcp) (Model Context Protocol) server integration
+- [Ollama](https://github.com/ollama/ollama) for running local LLMs
+- [UV](https://github.com/astral-sh/uv) for Python dependency management
+- Multiple MCP (Model Context Protocol) servers for specialized tasks (code analysis, testing)
+- A unified agent (`MCPEnhancedAgent`) to interact with these servers.
 
 ## Project Structure
 
 ```
-├── agents/                # Single-file agents
-│   └── agent.py           # Main agent implementation
-├── src/                   # Source code directory
-│   ├── baseagent/         # Main package
-│   └── mcp_server.py      # MCP server implementation
-├── scripts/               # Utility scripts
-│   └── setup.sh           # Setup script
-├── config/                # Configuration files
-├── memory-bank/           # Project memory and context
-└── requirements.txt       # Project dependencies
+├── agents/                     # Specialized MCP servers & clients
+│   ├── mcp_code_server.py      # Server for code analysis, formatting, fixing
+│   └── mcp_test_server.py      # Server for running tests
+├── examples/
+│   ├── mcp_code_client.py      # Client example for code server
+│   ├── mcp_test_client.py      # Client example for test server
+│   └── mcp_enhanced_agent_demo.py # Demo script for the enhanced agent
+├── src/
+│   ├── mcp_enhanced_agent.py   # Unified agent implementation
+│   └── storage/
+│       └── database.py         # SQLite database manager
+├── tests/
+│   └── test_sample/
+│       └── test_simple.py      # Sample test file
+├── data/
+│   └── mcp.db                  # SQLite database file (created automatically)
+├── memory-bank/                # Project memory and context
+├── scripts/
+│   └── setup.sh                # Setup script (may need updates)
+├── .env.example                # Example environment variables
+├── .gitignore
+├── README.md
+└── requirements.txt            # Project dependencies
 ```
 
 ## Prerequisites
 
 - Python 3.10+
-- [UV](https://github.com/astral-sh/uv) for dependency management
-- [Ollama](https://github.com/ollama/ollama) installed locally
+- [UV](https://github.com/astral-sh/uv) installed
+- [Ollama](https://github.com/ollama/ollama) installed locally (Optional, if using Ollama-based agents)
+- [Docker](https://www.docker.com/) installed (Optional, for running tests in Docker via MCP Test Server)
+- `ruff` installed globally or available in the environment (`pip install ruff`)
 
 ## Quick Setup
 
-The easiest way to set up the project is using our setup script:
+1.  **Clone the repository**:
+    ```bash
+    git clone <repository-url>
+    cd base-agent 
+    ```
 
-```bash
-# Make the script executable
-chmod +x scripts/setup.sh
+2.  **Set up virtual environment and install dependencies**:
+    ```bash
+    uv venv
+    source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+    uv pip install -r requirements.txt
+    ```
 
-# Run the setup script
-./scripts/setup.sh
-```
+3.  **(Optional) Pull Ollama models**:
+    ```bash
+    ollama pull mistral:7b
+    ```
 
-The setup script will:
-1. Check for Python 3.10+
-2. Install UV and Ollama if not already installed
-3. Set up a virtual environment
-4. Install required dependencies
-5. Download the necessary Ollama models
-6. Initialize the project structure
+4.  **(Optional) Copy environment variables**:
+    ```bash
+    cp .env.example .env 
+    # Adjust variables in .env if needed (e.g., server ports, DB path)
+    ```
 
-## Manual Setup
+## MCP Servers
 
-If you prefer to set up manually:
+This project utilizes specialized MCP servers for different backend tasks. They store their data in `data/mcp.db` (SQLite).
 
-1. **Clone the repository**:
-   ```bash
-   git clone <repository-url>
-   cd baseagent
-   ```
+### 1. MCP Code Server
 
-2. **Install UV**:
-   ```bash
-   curl -LsSf https://astral.sh/uv/install.sh | sh
-   ```
+- **Purpose**: Handles code analysis (linting), formatting, auto-fixing (using Ruff for Python), and storing/retrieving code snippets.
+- **Run**: 
+  ```bash
+  python agents/mcp_code_server.py
+  ```
+- **Default Port**: 8000 (Configurable via `MCP_CODE_SERVER_PORT` env var)
+- **Key Endpoints**:
+    - `POST /analyze`: Analyze code for issues.
+    - `POST /format`: Format code.
+    - `POST /fix`: Analyze and attempt to fix code.
+    - `POST /snippets`: Store a code snippet.
+    - `GET /snippets/{id}`: Retrieve a code snippet.
+    - `GET /snippets`: List snippet IDs.
+- **API Docs**: http://localhost:8000/docs (when running)
 
-3. **Install Ollama**:
-   ```bash
-   curl -LsSf https://ollama.ai/install.sh | sh
-   ```
+### 2. MCP Test Server
 
-4. **Set up a virtual environment with UV**:
-   ```bash
-   uv venv
-   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-   ```
-
-5. **Install dependencies**:
-   ```bash
-   uv pip install -r requirements.txt
-   ```
-
-6. **Pull required Ollama models**:
-   ```bash
-   ollama pull mistral:7b
-   ollama pull deepseek-r1:32b  # Optional - large model (32B parameters)
-   ```
+- **Purpose**: Runs tests within a specified project directory, supporting local execution or Docker containers. Provides cleaned-up, token-limited output suitable for LLMs.
+- **Run**: 
+  ```bash
+  python agents/mcp_test_server.py
+  ```
+- **Default Port**: 8001 (Configurable via `MCP_TEST_SERVER_PORT` env var)
+- **Key Endpoints**:
+    - `POST /run`: Execute tests based on provided configuration.
+    - `GET /result/{id}`: Get the results of a specific test run.
+    - `GET /results`: List recent test run IDs.
+    - `GET /last_failed`: Get the list of tests that failed in the last run.
+- **API Docs**: http://localhost:8001/docs (when running)
 
 ## Usage
 
-### Starting the MCP Server
+### Running the Enhanced Agent Demo
 
-The MCP server provides context to your agents. Start it with:
+The `MCPEnhancedAgent` (`src/mcp_enhanced_agent.py`) provides a unified Python interface to interact with both MCP servers.
 
-```bash
-python src/mcp_server.py
-```
-
-By default, the server runs on http://localhost:8080. You can customize with options:
+To see it in action, first start both MCP servers (see above), then run the demo script:
 
 ```bash
-python src/mcp_server.py --host 127.0.0.1 --port 9000 --debug
+python examples/mcp_enhanced_agent_demo.py
 ```
 
-### Running the Agent
+This demo will:
+1.  Analyze sample code using the Code Server.
+2.  Attempt to fix the sample code using the Code Server.
+3.  Run sample tests located in `tests/test_sample` using the Test Server.
+4.  Display the results and analysis from both servers.
 
-To run the agent and interact with the LLM:
+### Using the Agent or Servers Directly
 
-```bash
-# Run using the default model (Mistral 7B)
-python agents/agent.py
-
-# Specify a different model
-python agents/agent.py --model deepseek-r1:32b
-
-# Disable MCP integration
-python agents/agent.py --no-mcp
-```
-
-### MCP API Endpoints
-
-The MCP server provides these endpoints:
-
-- `GET /context` - Get full context
-- `GET /context/system` - Get system context
-- `POST /context/documents` - Add a document
-- `DELETE /context/documents/{id}` - Delete a document
-- `POST /context/conversation` - Add a conversation message
-- `DELETE /context/conversation` - Clear conversation history
-
-### Example: Adding Context
-
-You can add context to the MCP server that will be available to your agents:
-
-```bash
-curl -X POST http://localhost:8080/context/documents \
-  -H "Content-Type: application/json" \
-  -d '{
-    "id": "example-doc",
-    "content": "This is a sample document that provides context to the agent.",
-    "metadata": {"type": "note", "tags": ["example", "documentation"]}
-  }'
-```
+- You can integrate the `MCPEnhancedAgent` into your own applications.
+- You can interact with the MCP servers directly via HTTP requests (see client examples in `examples/` and the server API docs).
 
 ## Development
 
-- **Running the MCP server in development mode**:
-  ```bash
-  python src/mcp_server.py --debug
-  ```
-
-- **Examining server endpoints**:
-  Once the server is running, browse to http://localhost:8080/docs for the interactive API documentation.
+- **Running servers with auto-reload**:
+The `uvicorn.run` command in the server scripts includes `reload=True` by default for development.
+- **Database**: The SQLite database is stored at `data/mcp.db`. You can inspect it using tools like DB Browser for SQLite.
 
 ## Troubleshooting
 
-- **Ollama connection issues**: Ensure Ollama is running with `ollama serve`
-- **MCP server connection**: Verify the server is running and check the URL in the agent configuration
-- **Model not found**: Make sure you've pulled the model with `ollama pull <model-name>`
+- **Server Connection Issues**: Ensure the respective MCP servers are running. Check the host and port configured in your client or the `.env` file (defaults are `localhost:8000` for code, `localhost:8001` for test).
+- **`ruff` not found**: Make sure `ruff` is installed (`uv pip install ruff` or `pip install ruff`) and accessible in your PATH.
+- **Database Errors**: If you encounter issues, you can try deleting the `data/mcp.db` file. The servers will recreate it on startup.
+- **Docker Test Errors**: Ensure Docker Desktop (or Docker Engine) is running if you are using the 'docker' mode for the test server.
 
 ## License
 
