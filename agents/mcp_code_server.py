@@ -30,8 +30,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # Add src directory to path so we can import storage modules
-sys.path.append(str(Path(__file__).resolve().parent.parent))
-from src.storage.database import get_db_manager, DatabaseManager
+# sys.path.append(str(Path(__file__).resolve().parent.parent))
+# No longer needed with pytest.ini configuration
+from storage.database import get_db_manager, DatabaseManager
 
 # Set up logging
 logging.basicConfig(
@@ -105,52 +106,97 @@ async def get_db():
         await db_manager.disconnect()
 
 async def analyze_python_code(code: str, filename: Optional[str] = None) -> CodeAnalysisResult:
-    """Analyze Python code using Ruff."""
+    """Analyze Python code using Ruff for issues and formatting."""
     import tempfile
     import subprocess
+    import shutil
     
-    with tempfile.NamedTemporaryFile(suffix='.py', delete=False) as f:
-        f.write(code.encode())
-        temp_filename = f.name
+    issues = []
+    formatted_code = code # Default to original code
+    temp_filename = None
+
+    # Find ruff executable
+    ruff_executable = shutil.which("ruff")
+    if not ruff_executable:
+        logger.error("Ruff executable not found in PATH.")
+        # Return original code and an error message as an issue
+        return CodeAnalysisResult(
+            issues=[{"code": "MCP500", "message": "Ruff executable not found.", "location": {"row": 1, "column": 1}}],
+            formatted_code=code
+        )
     
     try:
-        # Run ruff for linting
-        result = subprocess.run(
-            ["ruff", "check", "--output-format=json", temp_filename],
+        with tempfile.NamedTemporaryFile(suffix='.py', delete=False, mode='w', encoding='utf-8') as f:
+            f.write(code)
+            temp_filename = f.name
+
+        # 1. Run ruff check for issues
+        check_cmd = [ruff_executable, "check", "--output-format=json", "--exit-zero", temp_filename]
+        logger.debug(f"Running ruff check: {' '.join(check_cmd)}")
+        check_result = subprocess.run(
+            check_cmd,
             capture_output=True,
-            text=True
+            text=True,
+            encoding='utf-8' # Specify encoding
         )
         
-        issues = []
-        if result.stdout:
+        if check_result.stdout:
             try:
-                issues = json.loads(result.stdout)
-            except json.JSONDecodeError:
-                issues = [{"message": "Error parsing ruff output", "location": {"row": 1, "column": 1}}]
-        
-        # Run ruff for formatting
+                issues = json.loads(check_result.stdout)
+            except json.JSONDecodeError as e:
+                logger.error(f"Error parsing ruff check output: {e}")
+                logger.error(f"Ruff check stdout: {check_result.stdout}")
+                issues = [{"code": "MCP501", "message": f"Error parsing ruff check output: {e}", "location": {"row": 1, "column": 1}}]
+        elif check_result.stderr:
+             logger.error(f"Ruff check error: {check_result.stderr}")
+             issues = [{"code": "MCP502", "message": f"Ruff check failed: {check_result.stderr[:100]}...", "location": {"row": 1, "column": 1}}]
+
+        # 2. Run ruff format separately
+        # Rerun on the original code to ensure formatting is clean
+        # (Checking might have modified the temp file if --fix was ever used, though not currently)
+        format_cmd = [ruff_executable, "format", temp_filename]
+        logger.debug(f"Running ruff format: {' '.join(format_cmd)}")
         format_result = subprocess.run(
-            ["ruff", "format", "--diff", temp_filename],
+            format_cmd,
             capture_output=True,
-            text=True
+            text=True,
+            encoding='utf-8' # Specify encoding
         )
-        
-        formatted_code = code
-        if not format_result.returncode:
-            # If successful, read the formatted file
+
+        if format_result.returncode == 0:
+            # If format succeeded, read the formatted file content
             try:
-                with open(temp_filename, 'r') as f:
-                    formatted_code = f.read()
+                with open(temp_filename, 'r', encoding='utf-8') as f_read:
+                    formatted_code = f_read.read()
             except Exception as e:
-                logger.error(f"Error reading formatted file: {e}")
-        
+                logger.error(f"Error reading formatted temp file: {e}")
+                # Keep original code as formatted_code, but add an issue
+                issues.append({"code": "MCP503", "message": f"Error reading formatted code: {e}", "location": {"row": 1, "column": 1}})
+        elif format_result.returncode != 0: # Check explicitly for non-zero return code
+            # Formatting failed, likely syntax error. Keep original code.
+            error_message = format_result.stderr or f"Ruff format exited with code {format_result.returncode}"
+            logger.warning(f"Ruff format failed: {error_message}")
+            # Add the specific MCP504 issue
+            issues.append({"code": "MCP504", "message": f"Ruff format failed (likely syntax error): {error_message[:200]}...", "location": {"row": 1, "column": 1}})
+            # Ensure original code is returned as formatted_code
+            formatted_code = code
+
         return CodeAnalysisResult(issues=issues, formatted_code=formatted_code)
+    
+    except Exception as e:
+        logger.error(f"Unexpected error during Ruff execution: {e}")
+        return CodeAnalysisResult(
+            issues=[{"code": "MCP505", "message": f"Internal server error during analysis: {e}", "location": {"row": 1, "column": 1}}],
+            formatted_code=code # Return original code on error
+        )
+
     finally:
         # Clean up the temporary file
-        try:
-            os.unlink(temp_filename)
-        except:
-            pass
+        if temp_filename and os.path.exists(temp_filename):
+            try:
+                os.unlink(temp_filename)
+            except OSError as e:
+                 logger.error(f"Error deleting temp file {temp_filename}: {e}")
 
 async def fix_python_code(code: str, filename: Optional[str] = None) -> CodeFixResult:
     """Analyze and attempt to fix Python code using Ruff."""
@@ -223,18 +269,26 @@ async def fix_python_code(code: str, filename: Optional[str] = None) -> CodeFixR
         except:
             pass
 
+@app.get("/")
+async def root():
+    """Root endpoint for health check."""
+    return {"service": "MCP Code Server", "status": "active"}
+
 @app.post("/analyze")
 async def analyze_code(request: CodeAnalysisRequest, db: DatabaseManager = Depends(get_db)):
     """Analyze code and return issues found."""
     if request.language == CodeLanguage.PYTHON:
         result = await analyze_python_code(request.code, request.filename)
         
+        # Generate analysis ID
+        analysis_id = str(uuid.uuid4())
+        
         # Store the analysis result in the database
         await db.store_code_analysis(
-            code=request.code,
-            language=request.language.value,
+            analysis_id=analysis_id,
             issues=result.issues,
-            formatted_code=result.formatted_code
+            formatted_code=result.formatted_code,
+            # code_id could be linked if snippet was stored first
         )
         
         return result
@@ -248,16 +302,37 @@ async def format_code(request: CodeFormatRequest, db: DatabaseManager = Depends(
     """Format code and return the formatted version."""
     if request.language == CodeLanguage.PYTHON:
         result = await analyze_python_code(request.code, request.filename)
-        
-        # Store the formatting result in the database
+
+        # Check if formatting specifically failed (MCP504)
+        format_failed = any(issue.get("code") == "MCP504" for issue in result.issues)
+
+        # Store analysis result regardless (useful for debugging maybe)
+        analysis_id = str(uuid.uuid4())
         await db.store_code_analysis(
-            code=request.code,
-            language=request.language.value,
-            issues=[],
-            formatted_code=result.formatted_code
+            analysis_id=analysis_id,
+            issues=result.issues, # Store issues found, including format error
+            formatted_code=result.formatted_code, # Store original or formatted code
         )
-        
-        return {"formatted_code": result.formatted_code}
+
+        if format_failed:
+            # Find the specific error message if available
+            error_msg = "Formatting failed (likely syntax error)."
+            for issue in result.issues:
+                if issue.get("code") == "MCP504":
+                    error_msg = issue.get("message", error_msg)
+                    break
+            # Return an error structure, including the original code
+            return fastapi.responses.JSONResponse(
+                status_code=400, # Bad Request due to syntax error preventing format
+                content={
+                    "error": "Formatting failed",
+                    "details": error_msg,
+                    "formatted_code": request.code # Return original code on format failure
+                }
+            )
+        else:
+             # Return successful formatting result
+            return {"formatted_code": result.formatted_code}
     else:
         # For now, only Python is supported
         return {"formatted_code": request.code}

@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 # Add the parent directory to the path so we can import the modules
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
-from agents.mcp_code_server import app, CodeSnippet
+from agents.mcp_code_server import app
 
 
 # Create a test client
@@ -66,10 +66,10 @@ def print_value():
     # There should be issues
     assert len(result["issues"]) > 0
     
-    # Check for specific issue types
-    issue_types = [issue["type"] for issue in result["issues"]]
-    assert any("undefined" in issue_type.lower() for issue_type in issue_types) or \
-           any("unused" in issue_type.lower() for issue_type in issue_types)
+    # Check for specific issue types (using 'code' field from Ruff output)
+    issue_codes = [issue["code"] for issue in result["issues"]]
+    assert "F401" in issue_codes  # Unused import
+    assert "F821" in issue_codes  # Undefined name
 
 
 def test_analyze_code_invalid_request():
@@ -96,59 +96,74 @@ def add(a,b):
 
 
 def test_format_code_invalid():
-    """Test formatting invalid Python code"""
+    """Test formatting invalid Python code which should return an error."""
     # Invalid syntax
     test_code = """
 def add(a,b)
     return a+b
 """
     response = client.post("/format", json={"code": test_code})
-    assert response.status_code == 200
+    # Expect a 400 Bad Request because syntax prevents formatting
+    assert response.status_code == 400
     result = response.json()
-    
-    # Should have error
+
+    # Check for the specific error structure
     assert "error" in result
-    assert result["error"] is not None
+    assert result["error"] == "Formatting failed"
+    assert "details" in result
+    assert "formatted_code" in result
+    # Ensure original code is returned in the error response
+    assert result["formatted_code"] == test_code
 
 
 def test_store_snippet():
     """Test storing a code snippet"""
-    snippet = {
+    snippet_data = {
         "code": "def test_function():\n    return 'Hello'",
         "language": "python",
-        "description": "Test function"
+        "metadata": {
+            "description": "Test function"
+        }
     }
-    
-    response = client.post("/store", json=snippet)
+
+    response = client.post("/snippets", json=snippet_data)
     assert response.status_code == 200
     result = response.json()
-    
+
     # Verify the snippet ID is returned
     assert "id" in result
     assert result["id"] is not None
+    # Check if metadata is stored correctly
+    assert result.get("metadata", {}).get("description") == snippet_data["metadata"]["description"]
 
 
 def test_get_snippet():
     """Test retrieving a stored code snippet"""
     # First store a snippet
-    snippet = {
+    snippet_data = {
         "code": "def hello_world():\n    print('Hello, World!')",
         "language": "python",
-        "description": "Hello World function"
+        "metadata": {
+            "description": "Hello World function"
+        }
     }
-    
-    store_response = client.post("/store", json=snippet)
-    snippet_id = store_response.json()["id"]
-    
+
+    store_response = client.post("/snippets", json=snippet_data)
+    assert store_response.status_code == 200
+    store_result = store_response.json()
+    assert "id" in store_result
+    snippet_id = store_result["id"]
+
     # Now retrieve it
     response = client.get(f"/snippets/{snippet_id}")
     assert response.status_code == 200
     result = response.json()
-    
+
     # Verify the retrieved snippet matches what we stored
-    assert result["code"] == snippet["code"]
-    assert result["language"] == snippet["language"]
-    assert result["description"] == snippet["description"]
+    assert result["code"] == snippet_data["code"]
+    assert result["language"] == snippet_data["language"]
+    # Check metadata description
+    assert result.get("metadata", {}).get("description") == snippet_data["metadata"]["description"]
 
 
 def test_get_nonexistent_snippet():
@@ -166,22 +181,25 @@ def test_get_all_snippets():
     ]
     
     for snippet in snippets:
-        client.post("/store", json=snippet)
+        client.post("/snippets", json=snippet)
     
     # Retrieve all snippets
     response = client.get("/snippets")
     assert response.status_code == 200
     result = response.json()
     
-    # There should be snippets in the result
-    assert len(result) > 0
-    
-    # Verify the structure of the returned snippets
-    for snippet in result:
-        assert "id" in snippet
-        assert "code" in snippet
-        assert "language" in snippet
-        assert "description" in snippet
+    # Check the response structure
+    assert "snippet_ids" in result
+    assert isinstance(result["snippet_ids"], list)
+    assert len(result["snippet_ids"]) > 0 # Check if list is not empty
+
+
+# Add a test for the /fix endpoint
+# def test_fix_code_valid():
+#     ...
+# 
+# def test_fix_code_no_fix():
+#     ...
 
 
 if __name__ == "__main__":

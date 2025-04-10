@@ -146,7 +146,7 @@ class DatabaseManager:
         await self.conn.execute("""
         CREATE TABLE IF NOT EXISTS code_analysis (
             id TEXT PRIMARY KEY,
-            code_id TEXT NOT NULL,
+            code_id TEXT, -- Made optional, removed NOT NULL
             timestamp REAL NOT NULL,
             issues TEXT,
             formatted_code TEXT,
@@ -436,9 +436,12 @@ class DatabaseManager:
             column_names = [col[0] for col in cursor.description]
             result_dict = dict(zip(column_names, result))
             
-            # Convert metadata back to dict if it exists
-            if result_dict.get("metadata"):
-                result_dict["metadata"] = json.loads(result_dict["metadata"])
+            # Convert metadata back to dict if it exists, default to empty dict if NULL
+            metadata_json = result_dict.get("metadata")
+            if metadata_json:
+                result_dict["metadata"] = json.loads(metadata_json)
+            else:
+                result_dict["metadata"] = {}
         
         return result_dict
     
@@ -488,15 +491,16 @@ class DatabaseManager:
     
     # Code Analysis Methods
     
-    async def store_code_analysis(self, analysis_id: str, code_id: str, 
+    async def store_code_analysis(self, analysis_id: str,
                                  issues: List[Dict[str, Any]], 
-                                 formatted_code: Optional[str] = None) -> str:
+                                 formatted_code: Optional[str] = None,
+                                 code_id: Optional[str] = None) -> str:
         """
         Store code analysis results in the database.
         
         Args:
             analysis_id: Unique identifier for the analysis
-            code_id: ID of the code snippet that was analyzed
+            code_id: Optional ID of the code snippet that was analyzed
             issues: List of issues found in the code
             formatted_code: The formatted version of the code (if available)
             
