@@ -1,39 +1,259 @@
 #!/usr/bin/env python3
 """
-Basic UV single-file agent for Ollama with MCP integration
+Matrix-inspired UV single-file agent for Ollama with MCP integration
+
+Dependencies:
+- requests==2.31.0
+- pydantic==2.4.2
+- tqdm==4.66.1
+- colorama==0.4.6
+- tenacity==8.2.3
 """
+# [dependencies]
+# requests = "^2.31.0"
+# pydantic = "^2.4.2" 
+# tqdm = "^4.66.1"
+# colorama = "^0.4.6"
+# tenacity = "^8.2.3"
+
 import argparse
 import sys
 import os
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple, Union, Callable
 import json
+import time
+import logging
+from enum import Enum
+from dataclasses import dataclass, field
+import re
+import traceback
+from pathlib import Path
+
+# Third-party imports
 import requests
+from pydantic import BaseModel, Field
+from tqdm import tqdm
+import colorama
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+# Initialize colorama for cross-platform colored terminal output
+colorama.init()
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(stream=sys.stdout)
+    ]
+)
+logger = logging.getLogger("neo-agent")
+
+# Constants
+DEFAULT_MODEL = "mistral:7b"
+DEEPSEEK_MODEL = "deepseek-r1:32b"
+DEFAULT_MCP_URL = "http://localhost:8080"
+DEFAULT_OLLAMA_URL = "http://localhost:11434"
+MAX_RETRIES = 3
+RETRY_WAIT_MULTIPLIER = 2
+RETRY_MAX_WAIT = 30
+
+# Model-specific settings
+MODEL_SETTINGS = {
+    "mistral:7b": {
+        "temperature": 0.7,
+        "max_tokens": 2048,
+        "top_p": 0.9,
+        "system_prompt": "You are a helpful AI assistant using the Mistral 7B model. Answer questions accurately and concisely."
+    },
+    "deepseek-r1:32b": {
+        "temperature": 0.5,
+        "max_tokens": 4096,
+        "top_p": 0.95,
+        "system_prompt": "You are a powerful AI assistant running on the DeepSeek-R1 32B model. Provide detailed, accurate, and well-reasoned responses."
+    }
+}
+
+# Task types
+class TaskType(str, Enum):
+    QUESTION_ANSWERING = "question_answering"
+    CODE_GENERATION = "code_generation"
+    PLANNING = "planning"
+    TOOL_EXECUTION = "tool_execution"
+
+
+class MCPResource(BaseModel):
+    """Resource model for MCP interactions"""
+    id: str
+    content: str
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class ToolConfig(BaseModel):
+    """Configuration for a tool that the agent can use"""
+    name: str
+    description: str
+    parameters: Dict[str, Any] = Field(default_factory=dict)
+    function: Optional[Callable] = None
+
+
+@dataclass
+class AgentContext:
+    """Context container for the agent"""
+    conversation_history: List[Dict[str, str]] = field(default_factory=list)
+    current_task: Optional[str] = None
+    resources: Dict[str, MCPResource] = field(default_factory=dict)
+    tools: Dict[str, ToolConfig] = field(default_factory=dict)
+    workspace_path: Optional[str] = None
+    task_plan: List[str] = field(default_factory=list)
 
 
 class OllamaAgent:
-    """A simple agent that communicates with Ollama and integrates with MCP"""
+    """Advanced agent for Ollama with planning, code generation, and MCP integration"""
     
-    def __init__(self, model: str = "mistral:7b", mcp_enabled: bool = True):
+    def __init__(
+        self, 
+        model: str = DEFAULT_MODEL, 
+        mcp_enabled: bool = True,
+        optimize_for_hardware: bool = True,
+        workspace_path: Optional[str] = None,
+        debug: bool = False
+    ):
+        """Initialize the agent with configuration options"""
         self.model = model
         self.mcp_enabled = mcp_enabled
-        self.ollama_url = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-        self.mcp_url = os.environ.get("MCP_SERVER_URL", "http://localhost:8080")
+        self.optimize_for_hardware = optimize_for_hardware
+        self.ollama_url = os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_URL)
+        self.mcp_url = os.environ.get("MCP_SERVER_URL", DEFAULT_MCP_URL)
         
-    def generate(self, prompt: str) -> str:
-        """Generate a response using Ollama"""
-        response = requests.post(
-            f"{self.ollama_url}/api/generate",
-            json={
-                "model": self.model,
-                "prompt": prompt,
-                "stream": False
-            }
+        # Set up debug mode
+        if debug:
+            logger.setLevel(logging.DEBUG)
+            
+        # Model settings from config or defaults
+        self.model_settings = MODEL_SETTINGS.get(model, MODEL_SETTINGS[DEFAULT_MODEL])
+        
+        # Initialize context
+        self.context = AgentContext(
+            workspace_path=workspace_path or os.getcwd()
         )
         
-        if response.status_code != 200:
-            raise Exception(f"Ollama API error: {response.text}")
+        # Configure hardware optimization if enabled
+        if optimize_for_hardware:
+            self._configure_for_hardware()
+        
+        # Register default tools
+        self._register_default_tools()
+        
+        logger.info(f"Agent initialized with model: {model}")
+        logger.info(f"MCP integration: {'enabled' if mcp_enabled else 'disabled'}")
+    
+    def _configure_for_hardware(self):
+        """Configure model settings based on available hardware"""
+        try:
+            import psutil
+            available_ram = psutil.virtual_memory().available / (1024**3)  # GB
+            cpu_count = psutil.cpu_count(logical=False)
             
-        return response.json().get("response", "")
+            logger.debug(f"Available RAM: {available_ram:.2f} GB, CPU cores: {cpu_count}")
+            
+            # Adjust settings based on hardware
+            if self.model == DEEPSEEK_MODEL:
+                if available_ram < 16:
+                    logger.warning(f"Limited RAM detected ({available_ram:.2f} GB). DeepSeek model may run slowly.")
+                    # Adjust to use less memory
+                    self.model_settings["max_tokens"] = 2048
+            
+            # Configure batch size based on available RAM
+            batch_size = max(1, min(8, int(available_ram / 4)))
+            self.model_settings["batch_size"] = batch_size
+            
+        except ImportError:
+            logger.warning("psutil not available. Hardware optimization disabled.")
+            return
+        except Exception as e:
+            logger.warning(f"Error during hardware configuration: {e}")
+    
+    def _register_default_tools(self):
+        """Register the default set of tools"""
+        default_tools = [
+            ToolConfig(
+                name="file_read",
+                description="Read a file from the workspace",
+                parameters={"path": "Path to the file to read"}
+            ),
+            ToolConfig(
+                name="file_write", 
+                description="Write content to a file in the workspace",
+                parameters={
+                    "path": "Path to the file to write",
+                    "content": "Content to write to the file"
+                }
+            ),
+            ToolConfig(
+                name="execute_command",
+                description="Execute a shell command",
+                parameters={"command": "Command to execute"}
+            ),
+            ToolConfig(
+                name="web_search",
+                description="Search the web for information",
+                parameters={"query": "Search query"}
+            )
+        ]
+        
+        for tool in default_tools:
+            self.register_tool(tool)
+    
+    def register_tool(self, tool_config: ToolConfig):
+        """Register a tool for the agent to use"""
+        self.context.tools[tool_config.name] = tool_config
+        logger.debug(f"Registered tool: {tool_config.name}")
+    
+    @retry(
+        stop=stop_after_attempt(MAX_RETRIES),
+        wait=wait_exponential(multiplier=RETRY_WAIT_MULTIPLIER, max=RETRY_MAX_WAIT),
+        retry=retry_if_exception_type((requests.RequestException, ConnectionError))
+    )
+    def generate(self, prompt: str, task_type: TaskType = TaskType.QUESTION_ANSWERING) -> str:
+        """Generate a response using Ollama with retry logic"""
+        # Adjust settings based on task type
+        settings = self.model_settings.copy()
+        if task_type == TaskType.CODE_GENERATION:
+            settings["temperature"] = 0.2  # Lower temperature for code
+        elif task_type == TaskType.PLANNING:
+            settings["temperature"] = 0.7  # Moderate temperature for planning
+        
+        try:
+            logger.debug(f"Sending request to Ollama ({self.model}, task: {task_type})")
+            response = requests.post(
+                f"{self.ollama_url}/api/generate",
+                json={
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "temperature": settings.get("temperature", 0.7),
+                    "max_tokens": settings.get("max_tokens", 2048),
+                    "top_p": settings.get("top_p", 0.9),
+                    "system": settings.get("system_prompt", "")
+                },
+                timeout=60  # Longer timeout for larger models
+            )
+            
+            if response.status_code != 200:
+                error_detail = f"Status: {response.status_code}, Response: {response.text[:100]}..."
+                logger.error(f"Ollama API error: {error_detail}")
+                raise Exception(f"Ollama API error: {error_detail}")
+                
+            result = response.json()
+            return result.get("response", "")
+            
+        except requests.RequestException as e:
+            logger.error(f"Request error: {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Error generating response: {str(e)}")
+            return f"Error: {str(e)}"
     
     def get_context(self) -> Optional[Dict[str, Any]]:
         """Get context from MCP server if enabled"""
@@ -41,63 +261,489 @@ class OllamaAgent:
             return None
             
         try:
-            response = requests.get(f"{self.mcp_url}/context")
+            logger.debug("Requesting context from MCP")
+            response = requests.get(f"{self.mcp_url}/context", timeout=10)
             if response.status_code == 200:
                 return response.json()
             else:
-                print(f"Warning: Could not fetch MCP context. Status: {response.status_code}")
+                logger.warning(f"Could not fetch MCP context. Status: {response.status_code}")
                 return None
-        except Exception as e:
-            print(f"Warning: MCP service unavailable: {e}")
+        except requests.RequestException as e:
+            logger.warning(f"MCP service request error: {str(e)}")
             return None
+        except Exception as e:
+            logger.warning(f"MCP service error: {str(e)}")
+            return None
+    
+    def load_resource(self, resource_id: str) -> Optional[MCPResource]:
+        """Load a resource from MCP or local cache"""
+        # Check if already in local cache
+        if resource_id in self.context.resources:
+            return self.context.resources[resource_id]
+        
+        # Try to fetch from MCP if enabled
+        if self.mcp_enabled:
+            try:
+                response = requests.get(
+                    f"{self.mcp_url}/context/documents/{resource_id}", 
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    resource_data = response.json()
+                    resource = MCPResource(**resource_data)
+                    # Cache the resource
+                    self.context.resources[resource_id] = resource
+                    return resource
+                else:
+                    logger.warning(f"Resource not found: {resource_id}")
+            except Exception as e:
+                logger.error(f"Error loading resource {resource_id}: {str(e)}")
+        
+        return None
+    
+    def save_resource(self, resource: MCPResource) -> bool:
+        """Save a resource to MCP and local cache"""
+        # Add to local cache
+        self.context.resources[resource.id] = resource
+        
+        # Save to MCP if enabled
+        if self.mcp_enabled:
+            try:
+                response = requests.post(
+                    f"{self.mcp_url}/context/documents",
+                    json=resource.dict(),
+                    timeout=10
+                )
+                if response.status_code in (200, 201):
+                    logger.debug(f"Resource saved to MCP: {resource.id}")
+                    return True
+                else:
+                    logger.warning(f"Failed to save resource to MCP: {response.status_code}")
+                    return False
+            except Exception as e:
+                logger.error(f"Error saving resource to MCP: {str(e)}")
+                return False
+        
+        return True  # Successfully saved to local cache
+    
+    def create_task_plan(self, task_description: str) -> List[str]:
+        """Create a step-by-step plan for completing a task"""
+        prompt = f"""
+        Create a step-by-step plan to accomplish the following task:
+        
+        {task_description}
+        
+        Break down the task into clear, executable steps. Each step should be concise and actionable.
+        Format the output as a numbered list of steps.
+        """
+        
+        try:
+            response = self.generate(prompt, task_type=TaskType.PLANNING)
+            # Parse the response to extract steps
+            steps = []
+            for line in response.split("\n"):
+                line = line.strip()
+                # Match numbered items with format "1. Step description"
+                if re.match(r"^\d+\.?\s+", line):
+                    steps.append(re.sub(r"^\d+\.?\s+", "", line))
+            
+            if not steps:
+                # Fallback if parsing fails
+                steps = [s.strip() for s in response.split("\n") if s.strip()]
+            
+            self.context.task_plan = steps
+            return steps
+            
+        except Exception as e:
+            logger.error(f"Error creating task plan: {str(e)}")
+            return ["Error: Could not create task plan"]
+    
+    def generate_code(self, code_description: str, language: str = "python") -> str:
+        """Generate code based on a description"""
+        prompt = f"""
+        Generate {language} code for the following:
+        
+        {code_description}
+        
+        Requirements:
+        - Code should be well-structured and documented
+        - Include error handling
+        - Follow best practices for {language}
+        - Be efficient and readable
+        
+        Please provide only the code, without explanations before or after.
+        """
+        
+        try:
+            return self.generate(prompt, task_type=TaskType.CODE_GENERATION)
+        except Exception as e:
+            logger.error(f"Error generating code: {str(e)}")
+            return f"# Error generating code: {str(e)}"
+    
+    def evaluate_code(self, code: str, language: str = "python") -> Dict[str, Any]:
+        """Evaluate generated code for quality and correctness"""
+        prompt = f"""
+        Evaluate the following {language} code:
+        
+        ```{language}
+        {code}
+        ```
+        
+        Provide an assessment with the following:
+        1. Overall quality (1-10)
+        2. Potential bugs or issues
+        3. Suggestions for improvement
+        4. Security concerns (if any)
+        
+        Format your response as JSON with keys: quality_score, issues, improvements, security_concerns
+        """
+        
+        try:
+            response = self.generate(prompt)
+            # Try to parse JSON response
+            try:
+                # Extract JSON if it's embedded in text
+                json_match = re.search(r"\{[\s\S]*\}", response)
+                if json_match:
+                    json_str = json_match.group(0)
+                    result = json.loads(json_str)
+                    return result
+                else:
+                    # Fallback to manual parsing
+                    return {
+                        "quality_score": 0,
+                        "issues": ["Could not parse evaluation"],
+                        "improvements": [],
+                        "security_concerns": []
+                    }
+            except json.JSONDecodeError:
+                # Structured fallback if JSON parsing fails
+                return {
+                    "quality_score": 0,
+                    "issues": ["Failed to parse evaluation result"],
+                    "improvements": [],
+                    "security_concerns": ["Unknown - parsing failed"]
+                }
+                
+        except Exception as e:
+            logger.error(f"Error evaluating code: {str(e)}")
+            return {
+                "quality_score": 0,
+                "issues": [f"Error: {str(e)}"],
+                "improvements": [],
+                "security_concerns": []
+            }
+    
+    def execute_tool(self, tool_name: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a registered tool"""
+        if tool_name not in self.context.tools:
+            return {"error": f"Tool not found: {tool_name}"}
+        
+        tool = self.context.tools[tool_name]
+        
+        try:
+            # Check for missing required parameters
+            for param_name, param_desc in tool.parameters.items():
+                if param_name not in parameters:
+                    return {"error": f"Missing required parameter: {param_name}"}
+            
+            # Handle built-in tools
+            if tool_name == "file_read":
+                return self._tool_file_read(parameters["path"])
+            elif tool_name == "file_write":
+                return self._tool_file_write(parameters["path"], parameters["content"])
+            elif tool_name == "execute_command":
+                return self._tool_execute_command(parameters["command"])
+            elif tool_name == "web_search":
+                return {"error": "Web search not implemented yet"}
+            
+            # Custom tool with function
+            if tool.function:
+                return tool.function(**parameters)
+            
+            return {"error": "Tool has no implementation"}
+            
+        except Exception as e:
+            logger.error(f"Error executing tool {tool_name}: {str(e)}")
+            return {
+                "error": f"Tool execution failed: {str(e)}",
+                "details": traceback.format_exc()
+            }
+    
+    def _tool_file_read(self, file_path: str) -> Dict[str, Any]:
+        """Read a file from the workspace"""
+        try:
+            # Security: Ensure path is within workspace
+            full_path = os.path.abspath(os.path.join(self.context.workspace_path or "", file_path))
+            if not full_path.startswith(os.path.abspath(self.context.workspace_path or "")):
+                return {"error": "File path is outside workspace"}
+            
+            if not os.path.exists(full_path):
+                return {"error": f"File not found: {file_path}"}
+            
+            with open(full_path, "r", encoding="utf-8") as file:
+                content = file.read()
+            
+            return {
+                "success": True,
+                "content": content,
+                "path": file_path
+            }
+            
+        except Exception as e:
+            return {"error": f"Error reading file: {str(e)}"}
+    
+    def _tool_file_write(self, file_path: str, content: str) -> Dict[str, Any]:
+        """Write content to a file in the workspace"""
+        try:
+            # Security: Ensure path is within workspace
+            full_path = os.path.abspath(os.path.join(self.context.workspace_path or "", file_path))
+            if not full_path.startswith(os.path.abspath(self.context.workspace_path or "")):
+                return {"error": "File path is outside workspace"}
+            
+            # Create directories if they don't exist
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            
+            with open(full_path, "w", encoding="utf-8") as file:
+                file.write(content)
+            
+            return {
+                "success": True,
+                "path": file_path,
+                "bytes_written": len(content)
+            }
+            
+        except Exception as e:
+            return {"error": f"Error writing file: {str(e)}"}
+    
+    def _tool_execute_command(self, command: str) -> Dict[str, Any]:
+        """Execute a shell command"""
+        try:
+            import subprocess
+            
+            # Security: Basic check for dangerous commands
+            dangerous_patterns = [
+                r"rm\s+-rf\s+/", 
+                r"mkfs", 
+                r":(){:|\:&};:"  # Fork bomb
+            ]
+            
+            for pattern in dangerous_patterns:
+                if re.search(pattern, command):
+                    return {"error": "Potentially dangerous command rejected"}
+            
+            # Execute command
+            process = subprocess.Popen(
+                command,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            
+            stdout, stderr = process.communicate(timeout=30)
+            
+            return {
+                "success": process.returncode == 0,
+                "return_code": process.returncode,
+                "stdout": stdout,
+                "stderr": stderr
+            }
+            
+        except subprocess.TimeoutExpired:
+            return {"error": "Command execution timed out"}
+        except Exception as e:
+            return {"error": f"Error executing command: {str(e)}"}
     
     def run_conversation(self):
         """Run an interactive conversation with the agent"""
-        print(f"🤖 BaseAgent using {self.model}")
+        print(f"{colorama.Fore.GREEN}🤖 Agent initialized with {self.model}{colorama.Style.RESET_ALL}")
         print("Type 'exit' or 'quit' to end the conversation.")
+        print("Type 'help' for available commands.")
         
         if self.mcp_enabled:
             print("MCP integration enabled. Attempting to fetch context...")
             context = self.get_context()
             if context:
-                print("✅ MCP context loaded successfully")
+                print(f"{colorama.Fore.GREEN}✅ MCP context loaded successfully{colorama.Style.RESET_ALL}")
             else:
-                print("⚠️ No MCP context available")
+                print(f"{colorama.Fore.YELLOW}⚠️ No MCP context available{colorama.Style.RESET_ALL}")
         
         while True:
             try:
-                user_input = input("\n👤 You: ")
+                user_input = input(f"\n{colorama.Fore.CYAN}👤 You: {colorama.Style.RESET_ALL}")
                 if user_input.lower() in ["exit", "quit"]:
                     break
+                
+                # Handle special commands
+                if user_input.lower() == "help":
+                    self._show_help()
+                    continue
+                elif user_input.lower().startswith("!plan "):
+                    # Create a task plan
+                    task = user_input[6:].strip()
+                    print(f"{colorama.Fore.YELLOW}Creating plan for: {task}{colorama.Style.RESET_ALL}")
+                    steps = self.create_task_plan(task)
+                    print(f"\n{colorama.Fore.GREEN}📋 Task Plan:{colorama.Style.RESET_ALL}")
+                    for i, step in enumerate(steps, 1):
+                        print(f"{i}. {step}")
+                    continue
+                elif user_input.lower().startswith("!code "):
+                    # Generate code
+                    desc = user_input[6:].strip()
+                    print(f"{colorama.Fore.YELLOW}Generating code for: {desc}{colorama.Style.RESET_ALL}")
                     
+                    # Get language if specified with format "!code python: description"
+                    language = "python"
+                    if ":" in desc:
+                        language, desc = desc.split(":", 1)
+                        language = language.strip().lower()
+                        desc = desc.strip()
+                    
+                    code = self.generate_code(desc, language)
+                    
+                    print(f"\n{colorama.Fore.GREEN}💻 Generated Code:{colorama.Style.RESET_ALL}")
+                    print(f"```{language}")
+                    print(code)
+                    print("```")
+                    continue
+                elif user_input.lower().startswith("!tool "):
+                    # Execute a tool
+                    tool_input = user_input[6:].strip()
+                    try:
+                        # Parse as "tool_name param1=value1 param2=value2"
+                        parts = tool_input.split()
+                        tool_name = parts[0]
+                        params = {}
+                        
+                        for param in parts[1:]:
+                            if "=" in param:
+                                key, value = param.split("=", 1)
+                                params[key] = value
+                        
+                        print(f"{colorama.Fore.YELLOW}Executing tool: {tool_name}{colorama.Style.RESET_ALL}")
+                        result = self.execute_tool(tool_name, params)
+                        
+                        print(f"\n{colorama.Fore.GREEN}🔧 Tool Result:{colorama.Style.RESET_ALL}")
+                        print(json.dumps(result, indent=2))
+                    except Exception as e:
+                        print(f"{colorama.Fore.RED}Error parsing tool command: {str(e)}{colorama.Style.RESET_ALL}")
+                    continue
+                
+                # Add to conversation history
+                self.context.conversation_history.append({
+                    "role": "user",
+                    "content": user_input
+                })
+                
                 # Augment with MCP context if available
                 prompt = user_input
                 if self.mcp_enabled:
                     context = self.get_context()
                     if context:
-                        prompt = f"[Context] {json.dumps(context)}\n\n[User Query] {user_input}"
+                        # Format conversation history for context
+                        history_str = "\n".join([
+                            f"{msg['role']}: {msg['content']}" 
+                            for msg in self.context.conversation_history[-5:]  # Last 5 messages
+                        ])
+                        
+                        prompt = f"""
+                        [Context]
+                        {json.dumps(context, indent=2)}
+                        
+                        [Conversation History]
+                        {history_str}
+                        
+                        [Current User Query]
+                        {user_input}
+                        """
                 
-                print("\n🤖 Agent: ", end="", flush=True)
-                response = self.generate(prompt)
+                print(f"\n{colorama.Fore.GREEN}🤖 Agent: {colorama.Style.RESET_ALL}", end="", flush=True)
+                
+                # Process with progress indicator for long responses
+                with tqdm(total=100, desc="Thinking", bar_format="{desc}: {bar}| {percentage:3.0f}%") as pbar:
+                    response = self.generate(prompt)
+                    # Simulate progress for UX
+                    for _ in range(4):
+                        time.sleep(0.1)
+                        pbar.update(25)
+                
                 print(response)
                 
+                # Add to conversation history
+                self.context.conversation_history.append({
+                    "role": "assistant",
+                    "content": response
+                })
+                
+                # Update MCP with conversation if enabled
+                if self.mcp_enabled:
+                    try:
+                        requests.post(
+                            f"{self.mcp_url}/context/conversation",
+                            json={
+                                "role": "assistant",
+                                "content": response,
+                                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                            }
+                        )
+                    except Exception as e:
+                        logger.debug(f"Failed to update MCP conversation: {str(e)}")
+                
             except KeyboardInterrupt:
-                print("\nExiting...")
+                print(f"\n{colorama.Fore.YELLOW}Exiting...{colorama.Style.RESET_ALL}")
                 break
             except Exception as e:
-                print(f"\nError: {e}")
+                print(f"\n{colorama.Fore.RED}Error: {str(e)}{colorama.Style.RESET_ALL}")
+                logger.error(f"Error in conversation loop: {str(e)}")
+                logger.debug(traceback.format_exc())
+    
+    def _show_help(self):
+        """Show help information"""
+        help_text = f"""
+{colorama.Fore.GREEN}Available Commands:{colorama.Style.RESET_ALL}
+  help               - Show this help message
+  exit, quit         - Exit the agent
+  !plan <task>       - Create a step-by-step plan for a task
+  !code <desc>       - Generate code based on description
+  !code <lang>: <desc> - Generate code in specified language
+  !tool <name> <params> - Execute a registered tool
+
+{colorama.Fore.GREEN}Available Tools:{colorama.Style.RESET_ALL}
+"""
+        for name, tool in self.context.tools.items():
+            help_text += f"  {name} - {tool.description}\n"
+            for param_name, param_desc in tool.parameters.items():
+                help_text += f"    {param_name}: {param_desc}\n"
+        
+        print(help_text)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="BaseAgent - Ollama with MCP integration")
-    parser.add_argument("--model", default="mistral:7b", help="Model to use (default: mistral:7b)")
+    parser = argparse.ArgumentParser(description="Matrix-inspired Agent with Ollama and MCP integration")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Model to use (default: {DEFAULT_MODEL})")
     parser.add_argument("--no-mcp", action="store_true", help="Disable MCP integration")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--workspace", help="Set the workspace path for file operations")
+    parser.add_argument("--no-optimize", action="store_true", help="Disable hardware optimization")
     
     args = parser.parse_args()
     
-    agent = OllamaAgent(model=args.model, mcp_enabled=not args.no_mcp)
+    agent = OllamaAgent(
+        model=args.model, 
+        mcp_enabled=not args.no_mcp,
+        optimize_for_hardware=not args.no_optimize,
+        workspace_path=args.workspace,
+        debug=args.debug
+    )
     agent.run_conversation()
 
 
 if __name__ == "__main__":
-    main() 
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{colorama.Fore.YELLOW}Agent terminated by user{colorama.Style.RESET_ALL}")
+    except Exception as e:
+        print(f"\n{colorama.Fore.RED}Unhandled error: {str(e)}{colorama.Style.RESET_ALL}")
+        traceback.print_exc() 
