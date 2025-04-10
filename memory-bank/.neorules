@@ -1,0 +1,48 @@
+# .neorules - NEO's Learning Journal
+
+## Project Patterns
+
+- **File Naming**: Use snake_case for Python files and directories
+- **Documentation**: All files should start with docstrings explaining their purpose
+- **Environment Variables**: Use environment variables for configuration with sensible defaults
+- **Error Handling**: Always wrap API calls in try-except blocks with informative error messages
+- **Testing**: Test both the MCP server and agents independently
+
+## User Preferences
+
+- **Simplicity**: User prefers simple and straightforward implementations
+- **Self-Contained**: Prefer self-contained solutions where possible
+- **Documentation**: Detailed documentation is important for this project
+- **Memory Bank**: Always update memory bank files after significant changes
+
+## Critical Implementation Paths
+
+- **Agent → Ollama Communication**: `agents/agent.py` - `OllamaAgent.generate()` method
+- **Agent → MCP Communication**: `agents/agent.py` - `OllamaAgent.get_context()` method
+- **MCP Server Endpoints**: `src/mcp_server.py` - FastAPI routes for context management
+- **Setup Process**: `scripts/setup.sh` - System setup and dependency management
+
+## Known Challenges
+
+- **Large Model Requirements**: DeepSeek-R1:32B requires significant computational resources
+- **Context Size Limitations**: Need to handle large contexts efficiently
+- **Dependency Management**: Keep UV dependencies up to date
+- **Integration Testing**: Testing the full system with all components requires careful setup
+
+## Evolution of Project Decisions
+
+- **Initial Decision**: Started with in-memory storage for MCP server for simplicity
+  - **Future Evolution**: Plan to add persistent storage options (SQLite, PostgreSQL)
+
+- **Initial Decision**: Basic authentication not implemented in MCP server
+  - **Future Evolution**: Will add basic auth and potentially JWT support
+
+- **Initial Decision**: Simple agent implementation to prove the concept
+  - **Future Evolution**: Enhance with tool usage and more sophisticated context handling
+
+## Tool Usage Patterns
+
+- **Setup Script**: Use `scripts/setup.sh` for initial system setup
+- **MCP Server**: Run with `python src/mcp_server.py` (add `--debug` for development)
+- **Agent**: Run with `python agents/agent.py` (add `--model` to specify different models)
+- **Memory Bank**: Keep memory-bank files updated with latest project status 
