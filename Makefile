@@ -1,7 +1,7 @@
 # BaseAgent MCP Development Makefile
 # Contains commonly used commands for development
 
-.PHONY: help setup test test-unit test-integration test-coverage format lint run-code-server run-test-server run-agents clean
+.PHONY: help setup test test-unit test-integration test-coverage test-file format lint run-code-server run-test-server run-agents clean
 
 # Default target executed when no arguments are given to make
 default: help
@@ -19,6 +19,7 @@ help:
 	@echo "  make test-unit       Run only unit tests"
 	@echo "  make test-integration Run only integration tests"
 	@echo "  make test-coverage   Run tests with coverage report"
+	@echo "  make test-file FILE=path/to/test_file.py  Run specific test file"
 	@echo ""
 	@echo "Code Quality:"
 	@echo "  make format          Format code with ruff"
@@ -56,6 +57,10 @@ test-unit:
 test-integration:
 	@echo "Running integration tests..."
 	./tests/run_tests.py tests/integration
+
+test-file:
+	@echo "Running tests in $(FILE)..."
+	./tests/run_tests.py $(FILE)
 
 test-coverage:
 	@echo "Running tests with coverage..."
