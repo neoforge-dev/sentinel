@@ -614,5 +614,68 @@ class TestMCPTestServer(unittest.TestCase):
         self.assertIn("MCP Test Server", response_pass.json()["service"])
 
 
+# --- Streaming Test ---
+
+@pytest.mark.asyncio
+async def test_run_tests_streaming_local(client_async, mock_db_manager, sample_project_path):
+    """Test the /run-tests endpoint with local mode for streaming response."""
+    config = {
+        "project_path": str(sample_project_path),
+        "test_path": "test_passing.py", 
+        "runner": "pytest",
+        "mode": "local"
+    }
+
+    # Mock the subprocess execution
+    with patch("asyncio.create_subprocess_exec") as mock_exec:
+        # Mock the process and its streams
+        mock_process = AsyncMock(spec=asyncio.subprocess.Process)
+        mock_stdout_stream = AsyncMock(spec=asyncio.StreamReader)
+        mock_stderr_stream = AsyncMock(spec=asyncio.StreamReader)
+        
+        # Define the lines to be returned by the mock streams
+        stdout_lines = [b"STDOUT: line 1\n", b"STDOUT: PASSED test_case_1\n", b"STDOUT: final line\n"]
+        stderr_lines = [b"STDERR: warning\n"]
+        
+        # Configure readline to yield lines and then empty bytes to signal EOF
+        mock_stdout_stream.readline.side_effect = stdout_lines + [b""]
+        mock_stderr_stream.readline.side_effect = stderr_lines + [b""]
+        
+        mock_process.stdout = mock_stdout_stream
+        mock_process.stderr = mock_stderr_stream
+        mock_process.wait = AsyncMock(return_value=0) # Simulate successful exit code
+        mock_process.pid = 12345 # Assign a dummy PID
+
+        mock_exec.return_value = mock_process
+
+        # Call the endpoint
+        response = await client_async.post("/run-tests", json=config)
+
+        # Assertions for the streaming response
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "text/plain; charset=utf-8"
+
+        # Consume the stream and check content
+        stream_content = []
+        async for line in response.aiter_lines():
+            stream_content.append(line)
+            
+        # Verify some expected lines are in the stream
+        assert any("--- Starting test run" in line for line in stream_content)
+        assert any("STDOUT: line 1" in line for line in stream_content)
+        assert any("STDERR: warning" in line for line in stream_content)
+        assert any("PASSED test_case_1" in line for line in stream_content)
+        assert any("--- Test run complete" in line for line in stream_content)
+
+        # Verify that the DB storage was scheduled (using the mock_db_manager fixture)
+        # BackgroundTasks might make this tricky; check if store_test_result was called
+        # Depending on exact execution, it might be awaited later.
+        # For now, let's check if it was *eventually* called (await_count might be > 0)
+        # A more robust test might involve patching BackgroundTasks or checking DB directly.
+        # Check call count after a small delay to allow background task potentially to run
+        await asyncio.sleep(0.1) 
+        assert mock_db_manager.store_test_result.await_count > 0
+
+
 if __name__ == "__main__":
     pytest.main(["-xvs", __file__]) 

@@ -443,5 +443,58 @@ def test_register_test_tools(mock_agent):
     assert "analyze_test_failures" in mock_agent.tools
 
 
+@patch('requests.post')
+def test_run_tests_streaming(self, mock_post):
+    """Test run_tests_with_mcp handling a streaming response."""
+    # Mock the response object
+    mock_response = MagicMock(spec=requests.Response)
+    mock_response.status_code = 200
+    mock_response.headers = {"content-type": "text/plain"}
+    
+    # Simulate iter_lines output
+    stream_lines = [
+        "--- Starting test run (stream-id-123) ---",
+        "STDOUT: Running tests...",
+        "STDOUT: PASSED test_1",
+        "STDERR: Some warning",
+        "--- Test run complete (stream-id-123). Status: success ---"
+    ]
+    mock_response.iter_lines.return_value = iter(stream_lines)
+    
+    # Configure the mock post call
+    mock_post.return_value = mock_response
+
+    payload = {
+        "project_path": "/path/stream", 
+        "mode": "local" # Ensure mode is local to trigger streaming
+    }
+    
+    # Patch print to capture output
+    with patch('builtins.print') as mock_print:
+        result = run_tests_with_mcp(**payload)
+
+        # Verify requests.post was called with stream=True
+        mock_post.assert_called_once()
+        call_args, call_kwargs = mock_post.call_args
+        self.assertEqual(call_kwargs["url"], f"{MOCK_URL}/run-tests")
+        self.assertEqual(call_kwargs["json"]["mode"], "local")
+        self.assertTrue(call_kwargs["stream"])
+        self.assertIn("X-API-Key", call_kwargs["headers"])
+
+        # Verify the streaming output was printed
+        self.assertGreater(mock_print.call_count, len(stream_lines)) # Print called for each line + start/end markers
+        printed_output = "\n".join([call.args[0] for call in mock_print.call_args_list])
+        self.assertIn("--- Streaming Test Output ---", printed_output)
+        self.assertIn("STDOUT: Running tests...", printed_output)
+        self.assertIn("STDERR: Some warning", printed_output)
+        self.assertIn("--- End of Stream ---", printed_output)
+
+        # Verify the returned result dictionary
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["result_id"], "stream-id-123")
+        self.assertIn("completed with status success", result["summary"])
+        self.assertIn("STDOUT: PASSED test_1", result["details"]) # Check details contain full output
+
+
 if __name__ == "__main__":
     pytest.main(["-xvs", __file__]) 

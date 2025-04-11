@@ -28,13 +28,13 @@
 
 - [ ] Command-line interface improvements
 - [x] Persistent storage for MCP servers (DB exists, code server integrated)
-- [ ] Authentication for MCP servers
+- [x] Authentication for MCP servers (Basic API Key implemented)
 - [ ] Multi-model support in a single session
 - [ ] Advanced context filtering
 - [ ] Agent template system
 - [ ] Additional example agents for different use cases
 - [ ] CI/CD pipeline
-- [ ] Streaming responses for tests and main agent
+- [x] Streaming responses for tests (Local execution only)
 - [ ] Real-world tool integrations (beyond simulated tools)
 - [ ] Performance benchmarks
 - [ ] Web UI for management
@@ -62,16 +62,15 @@ The test suite has been significantly improved, addressing numerous failures and
 
 ## Known Issues
 
-2. **No Authentication**: MCP servers have no authentication, making them insecure for production
-3. **Limited Model Support**: Currently only tested with Mistral and DeepSeek models
-4. **No Streaming**: Responses are not streamed, which can make the UI feel unresponsive for long generations or test runs
+1. **Basic Authentication**: Authentication uses a simple shared API key; more robust methods may be needed.
+2. **Limited Model Support**: Currently only tested with Mistral and DeepSeek models
+3. **Limited Streaming**: Only local test execution streams output; Docker tests and agent LLM responses do not.
 
 ## Next Major Features
 
-1. **Authentication**: Add basic auth for MCP servers (In Progress: Basic API key implemented).
-2. **Web UI**: Simple web interface for managing agents and contexts
-3. **Tool Integration**: Add more real-world tool integrations
-4. **Streaming Responses**: Implement streaming for better UX
-5. **Additional Test Frameworks**: Support for more testing frameworks
-6. **Comprehensive Testing**: Add integration tests.
-7. **Refactor test_fix_code**: Move or refactor the function in `examples/test_runner_plugin.py`. 
+1. **Web UI**: Simple web interface for managing agents and contexts
+2. **Tool Integration**: Add more real-world tool integrations
+3. **Streaming Responses**: Implement streaming for Docker tests and agent LLM responses.
+4. **Additional Test Frameworks**: Support for more testing frameworks
+5. **Comprehensive Testing**: Add integration tests.
+6. **Refactor test_fix_code**: Move or refactor the function in `examples/test_runner_plugin.py`. 

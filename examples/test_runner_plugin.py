@@ -97,16 +97,22 @@ def run_tests_with_mcp(
             
             # Return a summary based on the stream, as the full JSON might not be available
             # Or potentially fetch the full result using the ID if needed
-            return {
+            return { # Return summary derived from stream
                 "status": final_result_summary["status"],
                 "summary": final_result_summary["summary"],
-                "details": full_output, # Return captured stream as details
+                "details": full_output,
                 "result_id": final_result_summary["id"]
             }
         else:
             # Handle non-streaming response (e.g., Docker mode or error)
             return response.json()
         
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"Connection error running tests at {endpoint}: {e}")
+        return {"status": "error", "summary": f"Connection error contacting Test MCP server at {endpoint}", "details": str(e)}
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP error running tests at {endpoint}: {e.response.status_code} - {e.response.text}")
+        return {"status": "error", "summary": f"HTTP error {e.response.status_code} from Test MCP server at {endpoint}", "details": e.response.text}
     except requests.exceptions.RequestException as e:
         logger.error(f"Error running tests via MCP: {e}", exc_info=True)
         return {"status": "error", "summary": f"MCP request failed: {e}", "details": str(e)}
@@ -130,24 +136,15 @@ def get_last_failed_tests_with_mcp() -> Dict[str, Any]:
             "success": True,
             "failed_tests": response.json()
         }
-    except requests.exceptions.HTTPError as http_err:
-        return {
-            "success": False,
-            "message": f"HTTP error getting last failed tests: {http_err}",
-            "details": response.text if 'response' in locals() else str(http_err)
-        }
-    except requests.exceptions.RequestException as req_err:
-        return {
-            "success": False,
-            "message": f"Error connecting for last failed tests: {req_err}",
-            "details": str(req_err)
-        }
-    except Exception as e:
-         return {
-            "success": False,
-            "message": f"An unexpected error occurred: {e}",
-            "details": str(e)
-        }
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"Connection error getting last failed tests at {url}: {e}")
+        return {"status": "error", "summary": f"Connection error contacting Test MCP server at {url}", "details": str(e)}
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP error getting last failed tests at {url}: {e.response.status_code} - {e.response.text}")
+        return {"status": "error", "summary": f"HTTP error {e.response.status_code} from Test MCP server at {url}", "details": e.response.text}
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error getting last failed tests for {project_path} via MCP: {e}", exc_info=True)
+        return {"status": "error", "summary": f"Failed to get last failed tests: {e}", "details": str(e)}
 
 
 def get_test_result_with_mcp(result_id: str) -> Dict[str, Any]:
@@ -161,34 +158,17 @@ def get_test_result_with_mcp(result_id: str) -> Dict[str, Any]:
         response.raise_for_status()
         # Assuming success returns the JSON directly
         return response.json() 
-    except requests.exceptions.HTTPError as http_err:
-        status_code = http_err.response.status_code
-        error_detail = response.text if 'response' in locals() else str(http_err)
-        if status_code == 404:
-            message = f"Test result '{result_id}' not found."
-        else:
-            message = f"HTTP error retrieving test result: {http_err}"
-            
-        return {
-            "success": False,
-            "status": "error",
-            "message": message,
-            "details": error_detail
-        }
-    except requests.exceptions.RequestException as req_err:
-        return {
-            "success": False,
-            "status": "error",
-            "message": f"Error connecting to retrieve test result: {req_err}",
-            "details": str(req_err)
-        }
-    except Exception as e:
-         return {
-            "success": False,
-            "status": "error",
-            "message": f"An unexpected error occurred: {e}",
-            "details": str(e)
-        }
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"Connection error getting result {result_id} at {url}: {e}")
+        return {"status": "error", "summary": f"Connection error contacting Test MCP server at {url}", "details": str(e)}
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP error getting result {result_id} at {url}: {e.response.status_code} - {e.response.text}")
+        if e.response.status_code == 404:
+            return {"status": "error", "summary": f"Test result {result_id} not found", "details": e.response.text}
+        return {"status": "error", "summary": f"HTTP error {e.response.status_code} from Test MCP server at {url}", "details": e.response.text}
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error getting test result {result_id} via MCP: {e}", exc_info=True)
+        return {"status": "error", "summary": f"Failed to get result {result_id}: {e}", "details": str(e)}
 
 
 def apply_fix_and_retest(code: str, file_path: str, project_path: str) -> Dict[str, Any]:

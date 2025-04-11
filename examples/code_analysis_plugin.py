@@ -9,6 +9,7 @@ import sys
 import json
 import requests
 from typing import Dict, Any, List, Optional
+import logging
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -56,13 +57,15 @@ def analyze_code_with_mcp(code: str, language: str = "python") -> Dict[str, Any]
         response = requests.post(url, json=payload, headers=_get_headers())
         response.raise_for_status()
         return response.json()
-    except requests.RequestException as e:
-        return {
-            "success": False,
-            "message": f"Error connecting to MCP Code Server: {str(e)}",
-            "issues": [],
-            "formatted_code": None
-        }
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"Connection error analyzing code at {url}: {e}")
+        return {"success": False, "message": f"Connection error contacting Code MCP server at {url}", "details": str(e)}
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP error analyzing code at {url}: {e.response.status_code} - {e.response.text}")
+        return {"success": False, "message": f"HTTP error {e.response.status_code} from Code MCP server at {url}", "details": e.response.text}
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error analyzing code via MCP: {e}", exc_info=True)
+        return {"success": False, "message": f"Error analyzing code: {e}", "details": str(e)}
 
 
 def format_code_with_mcp(code: str, language: str = "python") -> Dict[str, Any]:
@@ -105,11 +108,15 @@ def store_snippet_with_mcp(code: str, language: str = "python", snippet_id: Opti
         response = requests.post(url, json=payload, headers=_get_headers())
         response.raise_for_status()
         return {"success": True, "id": snippet_id}
-    except requests.RequestException as e:
-        return {
-            "success": False,
-            "message": f"Error storing snippet: {str(e)}"
-        }
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"Connection error storing snippet at {url}: {e}")
+        return {"success": False, "message": f"Connection error contacting Code MCP server at {url}", "details": str(e)}
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP error storing snippet at {url}: {e.response.status_code} - {e.response.text}")
+        return {"success": False, "message": f"HTTP error {e.response.status_code} from Code MCP server at {url}", "details": e.response.text}
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error storing snippet via MCP: {e}", exc_info=True)
+        return {"success": False, "message": f"Error storing snippet: {e}", "details": str(e)}
 
 
 def register_code_tools(agent: OllamaAgent):

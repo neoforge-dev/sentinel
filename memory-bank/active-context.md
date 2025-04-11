@@ -2,7 +2,7 @@
 
 ## Current Focus
 
-Implementing authentication for MCP servers using a simple API key strategy.
+Improving testing and exploring next features (Web UI, Tool Integration, Full Streaming).
 
 ## Recent Changes
 
@@ -35,21 +35,28 @@ Implementing authentication for MCP servers using a simple API key strategy.
     - Added `Depends(verify_api_key)` to all MCP server endpoints.
     - Updated agent plugins to send `X-API-Key` header.
     - Updated server unit tests for authentication.
+26. Implemented streaming output for local test execution:
+    - Added `stream_subprocess_output` helper to `mcp_test_server`.
+    - Modified `/run-tests` endpoint to return `StreamingResponse`.
+    - Updated `test_runner_plugin` to handle streaming response.
+    - Updated `MCPEnhancedAgent` to process streamed test output.
 
 ## Next Steps
 
 1. **Refine Plugin Tests**: Manually update plugin unit tests to fully verify API key header usage.
 2. **Refactor `TestMCPTestServer`**: Convert unittest-style tests to pytest fixtures for consistency.
-3. **Improve Error Handling**: Enhance recovery from server failures.
-4. **Add More Test Frameworks**: Support more testing frameworks.
-5. **Setup CI/CD Pipeline**: Add automated testing and deployment.
-6. **Add Streaming Support**: Implement streaming for tests and agent responses.
-7. **Create Comprehensive Testing**: Add integration tests.
-8. **Refactor `test_fix_code` Error**: Address the fixture error.
+3. **Add Streaming Tests**: Implement unit tests for streaming functionality.
+4. **Implement Full Streaming**: Add streaming for Docker tests and agent LLM responses.
+5. **Improve Error Handling**: Enhance recovery from server failures.
+6. **Add More Test Frameworks**: Support more testing frameworks.
+7. **Setup CI/CD Pipeline**: Add automated testing and deployment.
+8. **Create Comprehensive Testing**: Add integration tests.
+9. **Refactor `test_fix_code` Error**: Address the fixture error.
 
 ## Active Decisions
 
 *Using simple API Key (X-API-Key header) for initial MCP authentication.*
+*Implemented basic streaming for local tests first due to complexity.*
 
 ## Current Considerations
 
