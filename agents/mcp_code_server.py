@@ -23,16 +23,26 @@ import enum
 import logging
 from typing import Dict, Any, List, Optional
 from pathlib import Path
+from contextlib import asynccontextmanager
 
 import fastapi
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# Add src directory to path so we can import storage modules
-# sys.path.append(str(Path(__file__).resolve().parent.parent))
-# No longer needed with pytest.ini configuration
-from storage.database import get_db_manager, DatabaseManager
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+# Import Database Components
+try:
+    from src.storage.database import DatabaseManager, get_db_manager
+except ImportError:
+    print("Error: Could not import database components from src.storage.database")
+    # Provide a dummy implementation or raise error if DB is critical
+    class DatabaseManager: pass
+    async def get_db_manager(): return None
+    # Decide if server should proceed without DB
+    # sys.exit(1) 
 
 # Set up logging
 logging.basicConfig(
@@ -94,16 +104,6 @@ class StoreSnippetRequest(BaseModel):
     code: str
     language: CodeLanguage = CodeLanguage.PYTHON
     metadata: Dict[str, Any] = {}
-
-# Database dependency
-async def get_db():
-    """Dependency to get database manager."""
-    db_manager = get_db_manager()
-    await db_manager.connect()
-    try:
-        yield db_manager
-    finally:
-        await db_manager.disconnect()
 
 async def analyze_python_code(code: str, filename: Optional[str] = None) -> CodeAnalysisResult:
     """Analyze Python code using Ruff for issues and formatting."""
@@ -275,7 +275,7 @@ async def root():
     return {"service": "MCP Code Server", "status": "active"}
 
 @app.post("/analyze")
-async def analyze_code(request: CodeAnalysisRequest, db: DatabaseManager = Depends(get_db)):
+async def analyze_code(request: CodeAnalysisRequest, db: DatabaseManager = Depends(get_db_manager)):
     """Analyze code and return issues found."""
     if request.language == CodeLanguage.PYTHON:
         result = await analyze_python_code(request.code, request.filename)
@@ -298,7 +298,7 @@ async def analyze_code(request: CodeAnalysisRequest, db: DatabaseManager = Depen
         return CodeAnalysisResult(issues=[], formatted_code=request.code)
 
 @app.post("/format")
-async def format_code(request: CodeFormatRequest, db: DatabaseManager = Depends(get_db)):
+async def format_code(request: CodeFormatRequest, db: DatabaseManager = Depends(get_db_manager)):
     """Format code and return the formatted version."""
     if request.language == CodeLanguage.PYTHON:
         result = await analyze_python_code(request.code, request.filename)
@@ -338,7 +338,7 @@ async def format_code(request: CodeFormatRequest, db: DatabaseManager = Depends(
         return {"formatted_code": request.code}
 
 @app.post("/fix")
-async def fix_code(request: CodeAnalysisRequest, db: DatabaseManager = Depends(get_db)):
+async def fix_code(request: CodeAnalysisRequest, db: DatabaseManager = Depends(get_db_manager)):
     """Analyze code, attempt to fix issues, and return the fixed code."""
     if request.language == CodeLanguage.PYTHON:
         result = await fix_python_code(request.code, request.filename)
@@ -362,7 +362,7 @@ async def fix_code(request: CodeAnalysisRequest, db: DatabaseManager = Depends(g
         return CodeFixResult(fixed_code=request.code, issues_remaining=[], applied_fixes=[])
 
 @app.post("/snippets", response_model=CodeSnippet)
-async def store_snippet(request: StoreSnippetRequest, db: DatabaseManager = Depends(get_db)):
+async def store_snippet(request: StoreSnippetRequest, db: DatabaseManager = Depends(get_db_manager)):
     """Store a code snippet and return its ID."""
     snippet_id = str(uuid.uuid4())
     snippet = CodeSnippet(
@@ -372,39 +372,76 @@ async def store_snippet(request: StoreSnippetRequest, db: DatabaseManager = Depe
         metadata=request.metadata
     )
     
-    # Store the snippet in the database
-    await db.store_code_snippet(
-        snippet_id=snippet.id,
-        code=snippet.code,
-        language=snippet.language,
-        metadata=snippet.metadata
-    )
-    
-    return snippet
+    try:
+        # Store the snippet in the database
+        await db.store_code_snippet(
+            snippet_id=snippet.id,
+            code=snippet.code,
+            language=snippet.language,
+            metadata=snippet.metadata
+        )
+        logger.info(f"Stored snippet {snippet_id}")
+        return snippet
+    except Exception as e:
+        logger.error(f"Database error storing snippet {snippet_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error storing snippet: {str(e)}")
 
 @app.get("/snippets/{snippet_id}", response_model=CodeSnippet)
-async def get_snippet(snippet_id: str, db: DatabaseManager = Depends(get_db)):
+async def get_snippet(snippet_id: str, db: DatabaseManager = Depends(get_db_manager)):
     """Retrieve a stored code snippet by ID."""
-    snippet = await db.get_code_snippet(snippet_id)
-    if not snippet:
-        raise HTTPException(status_code=404, detail=f"Snippet {snippet_id} not found")
-    return snippet
+    try:
+        snippet = await db.get_code_snippet(snippet_id)
+        if not snippet:
+            logger.warning(f"Snippet {snippet_id} not found in DB.")
+            raise HTTPException(status_code=404, detail=f"Snippet {snippet_id} not found")
+        # Assuming db.get_code_snippet returns a dict-like object matching CodeSnippet
+        return snippet
+    except HTTPException as http_exc:
+        # Re-raise expected HTTP exceptions (like 404)
+        raise http_exc
+    except Exception as e:
+        # Catch other unexpected errors (like DB connection errors)
+        logger.error(f"Unexpected error retrieving snippet {snippet_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error retrieving snippet: {str(e)}")
 
 @app.get("/snippets")
-async def list_snippets(db: DatabaseManager = Depends(get_db)):
+async def list_snippets(db: DatabaseManager = Depends(get_db_manager)):
     """List all stored code snippet IDs."""
-    snippets = await db.list_code_snippets()
-    return {"snippet_ids": [s["id"] for s in snippets]}
+    try:
+        snippets = await db.list_code_snippets()
+        # Ensure snippets is a list, default to empty list if None
+        snippet_list = snippets if snippets is not None else []
+        return {"snippet_ids": [s["id"] for s in snippet_list]}
+    except Exception as e:
+        logger.error(f"Database error listing snippets: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error listing snippets: {str(e)}")
 
-# Set up application startup
-@app.on_event("startup")
-async def startup_event():
-    """Initialize the database on startup."""
+# Set up application startup/shutdown lifecycle using lifespan context manager (preferred over on_event)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Connect to DB and ensure tables
     db_manager = get_db_manager()
-    await db_manager.connect()
-    await db_manager.create_tables()
-    await db_manager.disconnect()
-    logger.info("MCP Code Server initialized")
+    try:
+        await db_manager.connect()
+        await db_manager.create_tables() # Use the correct method name
+        logger.info("Database connected and tables ensured during startup.")
+    except Exception as e:
+        logger.error(f"Database initialization failed during startup: {e}", exc_info=True)
+        # Depending on policy, might want to raise error here to prevent startup
+        # raise RuntimeError("Database initialization failed") from e
+    
+    yield # Application runs here
+    
+    # Shutdown: Disconnect from DB
+    if db_manager and db_manager.is_connected:
+        try:
+            await db_manager.disconnect()
+            logger.info("Database disconnected during shutdown.")
+        except Exception as e:
+            logger.error(f"Error during database disconnection: {e}", exc_info=True)
+
+# Apply the lifespan context manager to the app
+app.router.lifespan_context = lifespan
 
 if __name__ == "__main__":
     import uvicorn

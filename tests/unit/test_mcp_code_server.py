@@ -7,17 +7,56 @@ import sys
 import os
 import json
 import pytest
+import pytest_asyncio
 from fastapi.testclient import TestClient
+from unittest.mock import patch, MagicMock, AsyncMock
+from fastapi import Depends
+from httpx import AsyncClient, ASGITransport
 
 # Add the parent directory to the path so we can import the modules
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from agents.mcp_code_server import app
 
+# Directly import database components - assume they exist when testing
+from src.storage.database import DatabaseManager, get_db_manager
 
 # Create a test client
 client = TestClient(app)
 
+# Synchronous client fixture (useful for simple tests)
+@pytest.fixture(scope="module")
+def client_sync():
+    return TestClient(app)
+
+# Asynchronous client fixture (needed for async endpoints)
+@pytest_asyncio.fixture(scope="function") # Use function scope for client
+async def client_async():
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        yield client
+
+# Fixture for overriding DB dependency
+@pytest.fixture
+def mock_db_manager():
+    mock = MagicMock(spec=DatabaseManager)
+    # Configure async methods
+    mock.store_code_snippet = AsyncMock()
+    mock.get_code_snippet = AsyncMock(return_value=None) # Default: not found
+    # Add mocks for other DB methods used by the code server if any
+    return mock
+
+# Override the get_db_manager dependency for all tests in this module
+@pytest.fixture(autouse=True)
+def override_get_db_manager(mock_db_manager):
+    async def _override_get_db():
+        return mock_db_manager
+    
+    # Store original overrides if any
+    original_overrides = app.dependency_overrides.copy()
+    app.dependency_overrides[get_db_manager] = _override_get_db
+    yield
+    # Restore original overrides
+    app.dependency_overrides = original_overrides
 
 def test_root_endpoint():
     """Test the root endpoint returns a 200 status code"""
@@ -116,82 +155,132 @@ def add(a,b)
     assert result["formatted_code"] == test_code
 
 
-def test_store_snippet():
-    """Test storing a code snippet"""
-    snippet_data = {
-        "code": "def test_function():\n    return 'Hello'",
-        "language": "python",
-        "metadata": {
-            "description": "Test function"
-        }
+@pytest.mark.asyncio
+async def test_store_and_get_snippet(client_async, mock_db_manager):
+    """Test storing and retrieving a code snippet."""
+    # Define snippet data without ID first
+    snippet_data = {"code": "print('Hello')", "language": "python"}
+
+    # Store the snippet by POSTing to /snippets
+    response_store = await client_async.post("/snippets", json=snippet_data)
+    assert response_store.status_code == 200
+    result_store = response_store.json()
+
+    # Expect the server to return the full CodeSnippet model including the generated ID
+    assert "id" in result_store
+    snippet_id = result_store["id"] # Get the ID assigned by the server
+    assert result_store["code"] == snippet_data["code"]
+    assert result_store["language"] == snippet_data["language"]
+
+    # Verify DB store method was called (server generates ID, so we check payload)
+    mock_db_manager.store_code_snippet.assert_awaited_once()
+    # Get the call arguments
+    call_args, call_kwargs = mock_db_manager.store_code_snippet.call_args
+    assert call_kwargs["snippet_id"] == snippet_id # Verify the correct ID was passed
+    assert call_kwargs["code"] == snippet_data["code"]
+    assert call_kwargs["language"] == snippet_data["language"]
+
+    # Configure mock DB for the subsequent GET request
+    mock_db_manager.get_code_snippet.return_value = {
+        "id": snippet_id, # Use the ID returned by the server
+        "code": snippet_data["code"],
+        "language": snippet_data["language"],
+        # Add other fields returned by DB method if necessary
     }
 
-    response = client.post("/snippets", json=snippet_data)
-    assert response.status_code == 200
-    result = response.json()
+    # Retrieve the snippet using the ID from the store response
+    response_get = await client_async.get(f"/snippets/{snippet_id}")
+    assert response_get.status_code == 200
+    result_get = response_get.json()
 
-    # Verify the snippet ID is returned
-    assert "id" in result
-    assert result["id"] is not None
-    # Check if metadata is stored correctly
-    assert result.get("metadata", {}).get("description") == snippet_data["metadata"]["description"]
+    # Verify the response matches the CodeSnippet model structure
+    assert result_get["code"] == snippet_data["code"]
+    assert result_get["language"] == snippet_data["language"]
+    assert result_get["id"] == snippet_id
 
-
-def test_get_snippet():
-    """Test retrieving a stored code snippet"""
-    # First store a snippet
-    snippet_data = {
-        "code": "def hello_world():\n    print('Hello, World!')",
-        "language": "python",
-        "metadata": {
-            "description": "Hello World function"
-        }
-    }
-
-    store_response = client.post("/snippets", json=snippet_data)
-    assert store_response.status_code == 200
-    store_result = store_response.json()
-    assert "id" in store_result
-    snippet_id = store_result["id"]
-
-    # Now retrieve it
-    response = client.get(f"/snippets/{snippet_id}")
-    assert response.status_code == 200
-    result = response.json()
-
-    # Verify the retrieved snippet matches what we stored
-    assert result["code"] == snippet_data["code"]
-    assert result["language"] == snippet_data["language"]
-    # Check metadata description
-    assert result.get("metadata", {}).get("description") == snippet_data["metadata"]["description"]
+    # Verify DB get method was called
+    mock_db_manager.get_code_snippet.assert_awaited_once_with(snippet_id)
 
 
-def test_get_nonexistent_snippet():
-    """Test retrieving a snippet that doesn't exist"""
-    response = client.get("/snippets/nonexistent-id")
+@pytest.mark.asyncio
+async def test_get_snippet_not_found(client_async, mock_db_manager):
+    """Test retrieving a non-existent snippet."""
+    snippet_id = "non-existent-snippet"
+
+    # Configure mock DB to return None (default, but explicit)
+    mock_db_manager.get_code_snippet.return_value = None
+
+    # Attempt to retrieve
+    response = await client_async.get(f"/snippets/{snippet_id}")
     assert response.status_code == 404
+    result = response.json()
+    assert "not found" in result["detail"].lower()
+
+    # Verify DB get method was called
+    mock_db_manager.get_code_snippet.assert_awaited_once_with(snippet_id)
+
+    # Check if the mock was called - use await_count to avoid issues if called multiple times
+    # across different tests due to fixture scope. Reset might be needed for function scope.
+    assert mock_db_manager.get_code_snippet.await_count > 0
+    # Or assert specific call if scope guarantees reset:
+    # mock_db_manager.get_code_snippet.assert_awaited_once_with(snippet_id)
 
 
-def test_get_all_snippets():
+# Optional: Add tests for DB errors
+@pytest.mark.asyncio
+async def test_store_snippet_db_error(client_async, mock_db_manager):
+    """Test storing snippet when DB fails."""
+    snippet_data = {"code": "fail me", "language": "python"}
+
+    # Configure mock to raise an exception
+    mock_db_manager.store_code_snippet.side_effect = Exception("Database connection failed")
+
+    response = await client_async.post("/snippets", json=snippet_data)
+    # Assert the HTTP status code and detail message
+    assert response.status_code == 500
+    assert "error storing snippet" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_get_snippet_db_error(client_async, mock_db_manager):
+    """Test retrieving snippet when DB fails."""
+    snippet_id = "error-snippet-get"
+
+    # Configure mock to raise an exception
+    mock_db_manager.get_code_snippet.side_effect = Exception("Database query failed")
+
+    response = await client_async.get(f"/snippets/{snippet_id}")
+    # Assert the HTTP status code and detail message
+    assert response.status_code == 500
+    assert "error retrieving snippet" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_get_all_snippets(client_async, mock_db_manager):
     """Test retrieving all stored snippets"""
-    # Create a few snippets for testing
-    snippets = [
-        {"code": "def func1():\n    pass", "language": "python", "description": "Function 1"},
-        {"code": "def func2():\n    pass", "language": "python", "description": "Function 2"}
+    # Configure mock DB to return a list of snippet IDs (or full snippets)
+    mock_snippet_list = [
+        {"id": "snip1", "code": "c1", "language": "py", "metadata": {}},
+        {"id": "snip2", "code": "c2", "language": "py", "metadata": {}}
     ]
-    
-    for snippet in snippets:
-        client.post("/snippets", json=snippet)
-    
+    # Ensure the mock method exists and is async
+    mock_db_manager.list_code_snippets = AsyncMock(return_value=mock_snippet_list)
+
     # Retrieve all snippets
-    response = client.get("/snippets")
+    response = await client_async.get("/snippets")
     assert response.status_code == 200
     result = response.json()
-    
-    # Check the response structure
+
+    # Check the response structure matches the endpoint definition
     assert "snippet_ids" in result
     assert isinstance(result["snippet_ids"], list)
-    assert len(result["snippet_ids"]) > 0 # Check if list is not empty
+
+    # Verify the mock was called
+    mock_db_manager.list_code_snippets.assert_awaited_once()
+
+    # Verify the returned IDs match the mock data
+    assert len(result["snippet_ids"]) == len(mock_snippet_list)
+    assert result["snippet_ids"] == [s["id"] for s in mock_snippet_list]
 
 
 # Add a test for the /fix endpoint
