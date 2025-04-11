@@ -597,22 +597,30 @@ async def run_tests_docker(config: TestExecutionConfig, db: DatabaseManager) -> 
 
         return test_result # Return the result object
     
-    except docker.errors.DockerException as docker_err:
+    except Exception as docker_err: 
+        # Check if it's likely a Docker error before proceeding
+        if "docker" not in str(type(docker_err)).lower() and "docker" not in str(docker_err).lower():
+             raise docker_err # Re-raise if it doesn't seem like a Docker error
+
         end_time = time.time()
         logger.error(f"Docker error during test execution: {docker_err}", exc_info=True)
-        # Determine specific error type if needed (e.g., ImageNotFound)
-        if isinstance(docker_err, docker.errors.ImageNotFound):
-            status = "error"
-            summary = f"Docker image not found: {docker_image}"
-            details = f"Command: {cmd}\nError: {str(docker_err)}"
-        elif isinstance(docker_err, docker.errors.APIError):
-            status = "error"
-            summary = f"Docker API error: {str(docker_err)}"
-            details = f"Command: {cmd}\nError: {str(docker_err)}\nTraceback: {traceback.format_exc()}"
-        else: # Generic DockerException
-            status="error"
-            summary=f"Docker error: {str(docker_err)}"
-            details=f"Command: {cmd}\nError: {str(docker_err)}\nTraceback: {traceback.format_exc()}"
+        
+        # Attempt to check specific Docker error types if possible
+        status = "error" # Default status
+        summary = f"Docker error: {str(docker_err)}" # Default summary
+        details = f"Command: {cmd}\nError: {str(docker_err)}\nTraceback: {traceback.format_exc()}" # Default details
+        
+        # Attempt to import docker errors safely for isinstance check
+        try:
+             import docker.errors
+             if isinstance(docker_err, docker.errors.ImageNotFound):
+                 summary = f"Docker image not found: {config.docker_image or 'python:3.11'}"
+                 details = f"Command: {cmd}\nError: {str(docker_err)}"
+             elif isinstance(docker_err, docker.errors.APIError):
+                 summary = f"Docker API error: {str(docker_err)}"
+                 details = f"Command: {cmd}\nError: {str(docker_err)}\nTraceback: {traceback.format_exc()}"
+        except ImportError:
+             logger.warning("Could not import docker.errors for specific error checking.")
 
         # Create and store error TestResult
         result = TestResult(
@@ -625,24 +633,6 @@ async def run_tests_docker(config: TestExecutionConfig, db: DatabaseManager) -> 
              result_id=result.id, status=status, summary=summary, details=details,
              passed_tests=[], failed_tests=[], skipped_tests=[],
              execution_time=result.execution_time, config=config.model_dump()
-        )
-        return result
-    except Exception as e:
-        end_time = time.time()
-        logger.error(f"Unexpected error running Docker container: {e}", exc_info=True)
-        status = "error"
-        summary = f"Unexpected error: {str(e)}"
-        details = f"Command: {cmd}\nError: {str(e)}\nTraceback: {traceback.format_exc()}"
-        result = TestResult(
-            id=result_id, project_path=config.project_path, test_path=config.test_path,
-            runner=config.runner.value, execution_mode=config.mode.value, status=status,
-            summary=summary, details=details, execution_time=end_time - start_time,
-            passed_tests=[], failed_tests=[], skipped_tests=[]
-        )
-        await db.store_test_result(
-            result_id=result.id, status=status, summary=summary, details=details,
-            passed_tests=[], failed_tests=[], skipped_tests=[],
-            execution_time=result.execution_time, config=config.model_dump()
         )
         return result
 

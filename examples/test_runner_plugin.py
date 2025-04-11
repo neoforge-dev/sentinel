@@ -165,15 +165,17 @@ def get_test_result_with_mcp(result_id: str) -> Dict[str, Any]:
         }
 
 
-def test_fix_code(code: str, file_path: str, project_path: str) -> Dict[str, Any]:
+def apply_fix_and_retest(code: str, file_path: str, project_path: str) -> Dict[str, Any]:
     """
-    Test if a code fix resolves failing tests
+    Test if a code fix resolves failing tests by applying it temporarily and running tests.
     
     This function:
-    1. Gets the list of failing tests
-    2. Creates a temporary copy of the file with the fix
-    3. Runs the failing tests
-    4. Returns the result
+    1. Gets the list of currently failing tests.
+    2. Creates a backup of the original file.
+    3. Applies the provided code fix to the original file.
+    4. Runs only the previously failing tests using the MCP test server.
+    5. Restores the original file from backup.
+    6. Returns the test result, indicating if the fix was successful.
     """
     # Get current failing tests
     last_failed = get_last_failed_tests_with_mcp()
@@ -404,7 +406,7 @@ def register_test_tools(agent: OllamaAgent):
                 "file_path": "Path to the file being fixed",
                 "project_path": "Path to the project directory"
             },
-            function=test_fix_code
+            function=apply_fix_and_retest
         )
     )
     

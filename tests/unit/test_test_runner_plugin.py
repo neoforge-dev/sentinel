@@ -21,7 +21,7 @@ from examples.test_runner_plugin import (
     run_tests_with_mcp,
     get_last_failed_tests_with_mcp,
     get_test_result_with_mcp,
-    test_fix_code,
+    apply_fix_and_retest,
     analyze_test_failures,
     register_test_tools
 )
@@ -245,7 +245,7 @@ def test_test_fix_no_failing_tests(mock_get_failed):
     }
     
     # Call the function
-    result = test_fix_code(
+    result = apply_fix_and_retest(
         code="def test_func():\n    return True",
         file_path="test_file.py",
         project_path="/tmp/project"
@@ -266,7 +266,7 @@ def test_test_fix_error_getting_failed_tests(mock_get_failed):
     }
     
     # Call the function
-    result = test_fix_code(
+    result = apply_fix_and_retest(
         code="def test_func():\n    return True",
         file_path="test_file.py",
         project_path="/tmp/project"
@@ -285,8 +285,8 @@ class TestTestRunnerPluginTests(unittest.TestCase):
     @patch('shutil.copy2')
     @patch('builtins.open', new_callable=mock_open)
     @patch('os.unlink')
-    def test_test_fix_success(self, mock_unlink, mock_open_func, mock_copy, mock_close, mock_mkstemp, mock_exists, mock_run_tests):
-        """Test the test_fix_code function with a successful fix test."""
+    def test_apply_fix_and_retest_success(self, mock_unlink, mock_open_func, mock_copy, mock_close, mock_mkstemp, mock_exists, mock_run_tests):
+        """Test the apply_fix_and_retest function with a successful fix test."""
         # Configure mocks
         mock_exists.return_value = True
         mock_mkstemp.return_value = (123, "/tmp/backup.py.bak")
@@ -317,8 +317,8 @@ class TestTestRunnerPluginTests(unittest.TestCase):
             full_file_path = os.path.join(project_path, file_path)
             backup_file_path = "/tmp/backup.py.bak"
 
-            # Call the function
-            result = test_fix_code(code=fixed_code, file_path=file_path, project_path=project_path)
+            # Call the renamed function
+            result = apply_fix_and_retest(code=fixed_code, file_path=file_path, project_path=project_path)
 
             # Assertions
             mock_get_failed.assert_called_once()

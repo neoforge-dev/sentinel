@@ -119,7 +119,7 @@ class MockDockerModule:
         def stop(self):
             pass
         
-        def remove(self):
+        def remove(self, force=None):
             pass
     
     class MockClient:
