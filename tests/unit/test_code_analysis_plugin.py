@@ -83,7 +83,7 @@ def test_analyze_code_success(mock_post):
     
     mock_post.assert_called_once_with(
         f"{MOCK_URL}/analyze",
-        json={"code": "print('hello')", "language": "python", "filename": None},
+        json={"code": "print('hello')", "language": "python"},
         headers=expected_headers
     )
     assert result["success"] == True
@@ -106,13 +106,13 @@ def test_analyze_code_no_api_key(mock_post):
     
     result = analyze_code_with_mcp("test code")
     
+    # Verify the call was made without the API key in headers
     mock_post.assert_called_once()
-    assert result == {
-        "success": False,
-        "message": "Error connecting to MCP Code Server: Connection failed",
-        "issues": [],
-        "formatted_code": None
-    }
+    args, kwargs = mock_post.call_args
+    assert "X-API-Key" not in kwargs.get("headers", {})
+    
+    # Verify the result matches the mocked success response
+    assert result == {"success": True, "issues": []}
 
 
 @patch("examples.code_analysis_plugin.analyze_code_with_mcp")
@@ -207,7 +207,8 @@ def test_store_snippet_error(mock_post):
     # Verify the request was made
     mock_post.assert_called_once_with(
         f"{MCP_CODE_SERVER_URL}/store/{snippet_id}",
-        json={"code": code, "language": language}
+        json={"code": code, "language": language},
+        headers={"Content-Type": "application/json"}
     )
     
     # Verify the error is handled

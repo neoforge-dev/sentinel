@@ -58,9 +58,9 @@ async def client():
 # Keep the synchronous client for synchronous tests
 client_sync = TestClient(app)
 
-def test_root_endpoint():
+def test_root_endpoint(fixture_client_sync):
     """Test the root endpoint returns a 200 status code"""
-    response = client_sync.get("/")
+    response = fixture_client_sync.get("/")
     assert response.status_code == 200
     assert "MCP Test Server" in response.text
 
@@ -165,11 +165,11 @@ def mock_docker_container_pass():
 
 @pytest.mark.asyncio
 @patch("agents.mcp_test_server.asyncio.create_subprocess_exec")
-async def test_run_tests_endpoint(mock_create_subprocess, mock_process):
+async def test_run_tests_endpoint(mock_create_subprocess, mock_process, fixture_client_sync):
     """Test the /run-tests endpoint, mocking asyncio subprocess execution."""
     # Configure the mock for asyncio.create_subprocess_exec to return our mock_process
     mock_create_subprocess.return_value = mock_process
-
+    
     # No need to mock process_test_output anymore, let the real code run
 
     test_config = {
@@ -181,11 +181,11 @@ async def test_run_tests_endpoint(mock_create_subprocess, mock_process):
         "timeout": 30,
         "max_tokens": 4000
     }
-
+    
     # Patch os checks as before
     with patch("os.path.isdir", return_value=True), \
          patch("os.path.exists", return_value=True):
-        response = client_sync.post("/run-tests", json=test_config)
+        response = fixture_client_sync.post("/run-tests", json=test_config)
 
     assert response.status_code == 200
     result = response.json()
@@ -453,7 +453,7 @@ def test_run_tests_invalid_path_sync(client_sync, override_verify_api_key_depend
 
 # Synchronous test client
 @pytest.fixture(scope="module")
-def client_sync():
+def fixture_client_sync():
     headers = {"X-API-Key": EXPECTED_API_KEY}
     return TestClient(app, headers=headers)
 
