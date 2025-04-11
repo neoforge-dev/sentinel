@@ -30,6 +30,7 @@ from enum import Enum
 import uuid
 import asyncio
 import logging
+import traceback
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
@@ -41,7 +42,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # Add src directory to path so we can import storage modules
 # sys.path.append(str(Path(__file__).resolve().parent.parent))
 # No longer needed with pytest.ini configuration
-from storage.database import get_db_manager, DatabaseManager
+from src.storage.database import get_db_manager, DatabaseManager
 
 # Set up logging
 logging.basicConfig(
@@ -61,10 +62,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# In-memory storage for test results
-test_results = {}
-last_failed_tests = set()
 
 # Token counter for output limitations
 def count_tokens(text: str, model: str = "gpt-4") -> int:
@@ -120,26 +117,6 @@ class TestResult(BaseModel):
     skipped_tests: List[str] = []
     execution_time: float
     created_at: datetime = Field(default_factory=datetime.now)
-
-
-# Function to store test results
-def store_test_result(result: TestResult) -> str:
-    """Store a test result and return its ID"""
-    result_id = result.id
-    test_results[result_id] = result
-    return result_id
-
-
-# Function to retrieve a stored test result
-def get_test_result(result_id: str) -> Optional[TestResult]:
-    """Get a test result by ID"""
-    return test_results.get(result_id)
-
-
-# Function to list all stored test result IDs
-def list_test_results() -> List[str]:
-    """List all test result IDs"""
-    return list(test_results.keys())
 
 
 def clean_test_output(output: str, max_tokens: int = 4000) -> str:
@@ -287,7 +264,6 @@ def truncate_to_token_limit(text: str, max_tokens: int) -> str:
 
 async def run_tests_local(config: TestExecutionConfig, db: DatabaseManager) -> TestResult:
     """Run tests locally using the specified configuration"""
-    global last_failed_tests  # Declare the global variable at the start of the function
     start_time = time.time()
     result_id = str(uuid.uuid4())
     
@@ -308,9 +284,13 @@ async def run_tests_local(config: TestExecutionConfig, db: DatabaseManager) -> T
         cmd.extend(["-x" if config.max_failures == 1 else f"--maxfail={config.max_failures}"])
     
     # Add last failed tests if requested
-    if config.run_last_failed and last_failed_tests:
-        for test in last_failed_tests:
-            cmd.append(test)
+    last_failed_tests_list = []
+    if config.run_last_failed:
+        # Fetch last failed tests from DB
+        last_failed_tests_list = await db.get_last_failed_tests(config.project_path)
+        if last_failed_tests_list:
+            for test in last_failed_tests_list:
+                cmd.append(test)
     
     # Add verbose output
     cmd.append("-v")
@@ -348,7 +328,7 @@ async def run_tests_local(config: TestExecutionConfig, db: DatabaseManager) -> T
                 details=f"Command: {' '.join(cmd)}\nTests timed out after {config.timeout} seconds",
                 execution_time=end_time - start_time,
                 passed_tests=[],
-                failed_tests=[],
+                failed_tests=last_failed_tests_list if config.run_last_failed else [], # Use fetched list for timeout
                 skipped_tests=[]
             )
             
@@ -359,10 +339,10 @@ async def run_tests_local(config: TestExecutionConfig, db: DatabaseManager) -> T
                 summary=result.summary,
                 details=result.details,
                 passed_tests=result.passed_tests,
-                failed_tests=[(t, "Timed out") for t in last_failed_tests], # Approximation for timeout
+                failed_tests=result.failed_tests,
                 skipped_tests=result.skipped_tests,
                 execution_time=result.execution_time,
-                config=config.model_dump() # Pass the original config dict
+                config=config.model_dump()
             )
             
             return result
@@ -374,7 +354,9 @@ async def run_tests_local(config: TestExecutionConfig, db: DatabaseManager) -> T
         
         # Extract test results
         results = extract_test_results(cleaned_output)
-        last_failed_tests = set(results["failed"])
+        # Update DB with new last failed tests
+        # Note: This part needs careful handling - decide if we overwrite or append
+        # await db.update_last_failed_tests(config.project_path, results["failed"]) 
         
         # Get summary
         summary = extract_test_summary(cleaned_output)
@@ -383,10 +365,14 @@ async def run_tests_local(config: TestExecutionConfig, db: DatabaseManager) -> T
         details = truncate_to_token_limit(cleaned_output, config.max_tokens)
         
         # Determine test status
-        status = "passed"
-        if process.returncode != 0:
+        status = "success" # Assume success initially
+        if process.returncode != 0 or results["failed"]:
             status = "failed"
-        
+        elif not results["passed"] and not results["failed"]:
+             # Handle cases where no tests were run or collected
+             status = "error" 
+             summary = "No tests found or executed." + (" " + summary if summary else "")
+
         # Create result object
         result = TestResult(
             id=result_id,
@@ -398,49 +384,11 @@ async def run_tests_local(config: TestExecutionConfig, db: DatabaseManager) -> T
             summary=summary,
             details=details,
             passed_tests=results["passed"],
-            failed_tests=results["failed"], # Store raw list in object for now
+            failed_tests=results["failed"],
             skipped_tests=results["skipped"],
             execution_time=end_time - start_time
         )
-        
-        # Format failed tests for database storage (List[Tuple[str, str]])
-        failed_tests_for_db = [(test_name, "See details") for test_name in results["failed"]]
 
-        # Store the result in the database
-        await db.store_test_result(
-            result_id=result.id,
-            status=result.status,
-            summary=result.summary,
-            details=result.details,
-            passed_tests=results["passed"],
-            failed_tests=failed_tests_for_db, # Pass the correctly formatted list
-            skipped_tests=results["skipped"],
-            execution_time=result.execution_time,
-            config=config.model_dump() # Pass the original config dict
-        )
-        
-        return result
-    
-    except Exception as e:
-        end_time = time.time()
-        
-        # Create result for error
-        result_id = str(uuid.uuid4())
-        result = TestResult(
-            id=result_id,
-            project_path=config.project_path,
-            test_path=config.test_path,
-            runner=config.runner.value,
-            execution_mode=config.mode.value,
-            status="error",
-            summary=f"Error running tests: {str(e)}",
-            details=f"Command: {' '.join(cmd)}\nError: {str(e)}",
-            execution_time=end_time - start_time,
-            passed_tests=[],
-            failed_tests=[],
-            skipped_tests=[]
-        )
-        
         # Store the result in the database
         await db.store_test_result(
             result_id=result.id,
@@ -448,10 +396,44 @@ async def run_tests_local(config: TestExecutionConfig, db: DatabaseManager) -> T
             summary=result.summary,
             details=result.details,
             passed_tests=result.passed_tests,
-            failed_tests=[(t, "Error during execution") for t in last_failed_tests], # Approximation for error
+            failed_tests=result.failed_tests,
             skipped_tests=result.skipped_tests,
             execution_time=result.execution_time,
-            config=config.model_dump() # Pass the original config dict
+            config=config.model_dump()
+        )
+        
+        return result
+    
+    except Exception as e:
+        end_time = time.time()
+        logger.error(f"Error during local test execution: {e}", exc_info=True)
+        # Create result for error
+        result = TestResult(
+            id=result_id, # Use the generated ID
+            project_path=config.project_path,
+            test_path=config.test_path,
+            runner=config.runner.value,
+            execution_mode=config.mode.value,
+            status="error",
+            summary=f"Error running tests: {str(e)}",
+            details=f"Command: {' '.join(cmd)}\nError: {str(e)}\nTraceback: {traceback.format_exc()}",
+            execution_time=end_time - start_time,
+            passed_tests=[],
+            failed_tests=[], # No info on failed tests during error
+            skipped_tests=[]
+        )
+
+        # Store the result in the database
+        await db.store_test_result(
+            result_id=result.id,
+            status=result.status,
+            summary=result.summary,
+            details=result.details,
+            passed_tests=result.passed_tests,
+            failed_tests=result.failed_tests,
+            skipped_tests=result.skipped_tests,
+            execution_time=result.execution_time,
+            config=config.model_dump()
         )
         
         return result
@@ -459,7 +441,6 @@ async def run_tests_local(config: TestExecutionConfig, db: DatabaseManager) -> T
 
 async def run_tests_docker(config: TestExecutionConfig, db: DatabaseManager) -> TestResult:
     """Run tests in Docker container"""
-    global last_failed_tests  # Declare the global variable at the start of the function
     start_time = time.time()
     result_id = str(uuid.uuid4())
     
@@ -470,39 +451,38 @@ async def run_tests_docker(config: TestExecutionConfig, db: DatabaseManager) -> 
         client = docker.from_env()
         
         # Prepare command
-        cmd = []
+        cmd_list = []
         if config.runner == TestRunner.UV:
-            cmd = ["uv", "run", "-m", "pytest"]
+            cmd_list = ["uv", "run", "-m", "pytest"]
         elif config.runner == TestRunner.PYTEST:
-            cmd = ["python", "-m", "pytest"]
+            cmd_list = ["python", "-m", "pytest"]
         elif config.runner == TestRunner.UNITTEST:
-            cmd = ["python", "-m", "unittest"]
+            cmd_list = ["python", "-m", "unittest"]
         
         # Add test path (relative to /app in container)
         test_path = os.path.join("/app", config.test_path)
-        cmd.append(test_path)
+        cmd_list.append(test_path)
         
         # Add max failures if specified
         if config.max_failures is not None:
-            cmd.extend(["-x" if config.max_failures == 1 else f"--maxfail={config.max_failures}"])
+            cmd_list.extend(["-x" if config.max_failures == 1 else f"--maxfail={config.max_failures}"])
         
         # Add last failed tests if requested
-        if config.run_last_failed and last_failed_tests:
-            for test in last_failed_tests:
-                cmd.append(test)
+        last_failed_tests_list = []
+        if config.run_last_failed:
+            last_failed_tests_list = await db.get_last_failed_tests(config.project_path)
+            if last_failed_tests_list:
+                for test in last_failed_tests_list:
+                    cmd_list.append(test)
         
-        # Add verbose output
-        cmd.append("-v")
-        
-        # Add any additional arguments
-        cmd.extend(config.additional_args)
-        
+        cmd = " ".join(cmd_list) # Docker exec usually takes a string command
+
         # Run container
         docker_image = config.docker_image or "python:3.11"
         
         container = client.containers.run(
             docker_image,
-            command=" ".join(cmd),
+            command=cmd,
             volumes={config.project_path: {'bind': '/app', 'mode': 'rw'}},
             working_dir="/app",
             detach=True
@@ -510,12 +490,16 @@ async def run_tests_docker(config: TestExecutionConfig, db: DatabaseManager) -> 
         
         # Wait for container to finish with timeout
         try:
+            # Wait for container and get status code
+            container_status = container.wait(timeout=config.timeout)
+            exit_code = container_status["StatusCode"]
+
+            # Get logs after container finished
             output = container.logs().decode('utf-8')
             cleaned_output = clean_test_output(output, config.max_tokens)
             
             # Extract test results
             results = extract_test_results(cleaned_output)
-            last_failed_tests = set(results["failed"])
             
             # Get summary
             summary = extract_test_summary(cleaned_output)
@@ -523,8 +507,13 @@ async def run_tests_docker(config: TestExecutionConfig, db: DatabaseManager) -> 
             # Truncate to token limit
             details = truncate_to_token_limit(cleaned_output, config.max_tokens)
             
-            container_info = container.inspect()
-            exit_code = container_info["State"]["ExitCode"]
+            # Determine status based on exit code and test results
+            status = "success" if exit_code == 0 else "failed"
+            if status == "success" and results["failed"]:
+                status = "failed"
+            elif not results["passed"] and not results["failed"] and exit_code == 0:
+                status = "error"
+                summary = "No tests found or executed in Docker." + (" " + summary if summary else "")
             
             # Create result
             test_result = TestResult(
@@ -533,7 +522,7 @@ async def run_tests_docker(config: TestExecutionConfig, db: DatabaseManager) -> 
                 test_path=config.test_path,
                 runner=config.runner.value,
                 execution_mode=config.mode.value,
-                status="success" if exit_code == 0 else "failed",
+                status=status,
                 summary=summary,
                 details=details,
                 passed_tests=results["passed"],
@@ -552,72 +541,110 @@ async def run_tests_docker(config: TestExecutionConfig, db: DatabaseManager) -> 
                 failed_tests=test_result.failed_tests,
                 skipped_tests=test_result.skipped_tests,
                 execution_time=test_result.execution_time,
-                config=config.model_dump() # Pass the original config dict
+                config=config.model_dump()
             )
-            
+
+        except asyncio.TimeoutError:
+             # Handle container run timeout
+             logger.warning(f"Docker container timed out after {config.timeout} seconds.")
+             try:
+                 container.stop()
+             except docker.errors.APIError as stop_err:
+                 logger.warning(f"Failed to stop timed out container: {stop_err}")
+             status = "timeout"
+             summary = f"Tests timed out after {config.timeout} seconds in Docker"
+             details = f"Command: {cmd}\nTimeout after {config.timeout} seconds."
+             test_result = TestResult(
+                 id=result_id, project_path=config.project_path, test_path=config.test_path,
+                 runner=config.runner.value, execution_mode=config.mode.value, status=status,
+                 summary=summary, details=details, execution_time=config.timeout # Use configured timeout
+             )
+             await db.store_test_result(
+                 result_id=result_id, status=status, summary=summary, details=details,
+                 passed_tests=[], failed_tests=last_failed_tests_list if config.run_last_failed else [],
+                 skipped_tests=[], execution_time=test_result.execution_time, config=config.model_dump()
+             )
         except Exception as e:
-            container.stop()
-            raise e
+             # Handle other unexpected errors processing results
+             logger.error(f"Unexpected error processing Docker results: {e}", exc_info=True)
+             try:
+                 container.stop()
+             except docker.errors.APIError:
+                 pass 
+             status = "error"
+             summary = f"Unexpected error processing results: {str(e)}"
+             details = f"Command: {cmd}\nError: {str(e)}\nTraceback: {traceback.format_exc()}"
+             test_result = TestResult(
+                 id=result_id, project_path=config.project_path, test_path=config.test_path,
+                 runner=config.runner.value, execution_mode=config.mode.value, status=status,
+                 summary=summary, details=details, execution_time=time.time() - start_time
+             )
+             await db.store_test_result(
+                 result_id=result_id, status=status, summary=summary, details=details,
+                 passed_tests=[], failed_tests=[], skipped_tests=[],
+                 execution_time=test_result.execution_time, config=config.model_dump()
+             )
         finally:
-            # Cleanup
-            container.remove()
-        
-        return test_result
+             # Ensure container cleanup
+             try:
+                 container.remove(force=True)
+             # Catch broader exception here too
+             except docker.errors.DockerException as remove_err:
+                 logger.warning(f"Failed to remove Docker container {container.id}: {remove_err}")
+             # Optionally catch Exception if remove fails for other reasons
+             except Exception as general_remove_err:
+                  logger.warning(f"Unexpected error removing container {container.id}: {general_remove_err}")
+
+        return test_result # Return the result object
     
-    except ImportError:
-        test_result = TestResult(
-            id=result_id,
-            project_path=config.project_path,
-            test_path=config.test_path,
-            runner=config.runner.value,
-            execution_mode=config.mode.value,
-            status="error",
-            summary="Docker Python package not installed",
-            details="Please install the docker package: pip install docker",
-            execution_time=time.time() - start_time,
-            passed_tests=[],
-            failed_tests=[(t, "Docker import error") for t in last_failed_tests], # Approximation
-            skipped_tests=[]
+    except docker.errors.DockerException as docker_err:
+        end_time = time.time()
+        logger.error(f"Docker error during test execution: {docker_err}", exc_info=True)
+        # Determine specific error type if needed (e.g., ImageNotFound)
+        if isinstance(docker_err, docker.errors.ImageNotFound):
+            status = "error"
+            summary = f"Docker image not found: {docker_image}"
+            details = f"Command: {cmd}\nError: {str(docker_err)}"
+        elif isinstance(docker_err, docker.errors.APIError):
+            status = "error"
+            summary = f"Docker API error: {str(docker_err)}"
+            details = f"Command: {cmd}\nError: {str(docker_err)}\nTraceback: {traceback.format_exc()}"
+        else: # Generic DockerException
+            status="error"
+            summary=f"Docker error: {str(docker_err)}"
+            details=f"Command: {cmd}\nError: {str(docker_err)}\nTraceback: {traceback.format_exc()}"
+
+        # Create and store error TestResult
+        result = TestResult(
+             id=result_id, project_path=config.project_path, test_path=config.test_path,
+             runner=config.runner.value, execution_mode=config.mode.value, status=status,
+             summary=summary, details=details, execution_time=end_time - start_time,
+             passed_tests=[], failed_tests=[], skipped_tests=[] # Empty lists for errors
         )
         await db.store_test_result(
-            result_id=test_result.id,
-            status=test_result.status,
-            summary=test_result.summary,
-            details=test_result.details,
-            passed_tests=test_result.passed_tests,
-            failed_tests=[(t, "Docker import error") for t in last_failed_tests], # Approximation
-            skipped_tests=test_result.skipped_tests,
-            execution_time=test_result.execution_time,
-            config=config.model_dump() # Pass the original config dict
+             result_id=result.id, status=status, summary=summary, details=details,
+             passed_tests=[], failed_tests=[], skipped_tests=[],
+             execution_time=result.execution_time, config=config.model_dump()
         )
-        return test_result
+        return result
     except Exception as e:
-        test_result = TestResult(
-            id=result_id,
-            project_path=config.project_path,
-            test_path=config.test_path,
-            runner=config.runner.value,
-            execution_mode=config.mode.value,
-            status="error",
-            summary=f"Error running tests in Docker: {str(e)}",
-            details=str(e),
-            execution_time=time.time() - start_time,
-            passed_tests=[],
-            failed_tests=[(t, "Docker execution error") for t in last_failed_tests], # Approximation
-            skipped_tests=[]
+        end_time = time.time()
+        logger.error(f"Unexpected error running Docker container: {e}", exc_info=True)
+        status = "error"
+        summary = f"Unexpected error: {str(e)}"
+        details = f"Command: {cmd}\nError: {str(e)}\nTraceback: {traceback.format_exc()}"
+        result = TestResult(
+            id=result_id, project_path=config.project_path, test_path=config.test_path,
+            runner=config.runner.value, execution_mode=config.mode.value, status=status,
+            summary=summary, details=details, execution_time=end_time - start_time,
+            passed_tests=[], failed_tests=[], skipped_tests=[]
         )
         await db.store_test_result(
-            result_id=test_result.id,
-            status=test_result.status,
-            summary=test_result.summary,
-            details=test_result.details,
-            passed_tests=test_result.passed_tests,
-            failed_tests=[(t, "Docker execution error") for t in last_failed_tests], # Approximation
-            skipped_tests=test_result.skipped_tests,
-            execution_time=test_result.execution_time,
-            config=config.model_dump() # Pass the original config dict
+            result_id=result.id, status=status, summary=summary, details=details,
+            passed_tests=[], failed_tests=[], skipped_tests=[],
+            execution_time=result.execution_time, config=config.model_dump()
         )
-        return test_result
+        return result
 
 
 @app.get("/")
@@ -627,22 +654,28 @@ async def root():
 
 
 @app.post("/run-tests", response_model=TestResult)
-async def run_tests(config: TestExecutionConfig, background_tasks: BackgroundTasks, db: DatabaseManager = Depends(get_db_manager)):
-    """Run tests with the given configuration"""
+async def run_tests_endpoint(config: TestExecutionConfig, db: DatabaseManager = Depends(get_db_manager)):
+    """Run tests with the given configuration (Endpoint wrapper)"""
     # Validate project path
     if not os.path.isdir(config.project_path):
         raise HTTPException(status_code=400, detail=f"Project path not found: {config.project_path}")
     
-    # Check test path
-    test_path = os.path.join(config.project_path, config.test_path)
-    if not os.path.exists(test_path):
-        raise HTTPException(status_code=400, detail=f"Test path not found: {test_path}")
+    # Check test path relative to project path
+    relative_test_path = config.test_path
+    absolute_test_path = os.path.join(config.project_path, relative_test_path)
+    if not os.path.exists(absolute_test_path):
+        # Allow running without a specific path if intent is to run all tests
+        if relative_test_path: # Only raise if a specific non-existent path was given
+             raise HTTPException(status_code=400, detail=f"Test path not found: {absolute_test_path}")
     
     # Run tests based on mode
     if config.mode == ExecutionMode.LOCAL:
         return await run_tests_local(config, db)
-    else:
+    elif config.mode == ExecutionMode.DOCKER:
         return await run_tests_docker(config, db)
+    else:
+        # Should be caught by Pydantic validation, but handle defensively
+        raise HTTPException(status_code=400, detail=f"Invalid execution mode: {config.mode}")
 
 
 @app.get("/results/{result_id}", response_model=TestResult)
@@ -686,7 +719,7 @@ async def startup_event():
     """Initialize the database on startup."""
     db_manager = get_db_manager()
     await db_manager.connect()
-    await db_manager.create_tables()
+    await db_manager._create_tables()
     await db_manager.disconnect()
     logger.info("MCP Test Server initialized")
 

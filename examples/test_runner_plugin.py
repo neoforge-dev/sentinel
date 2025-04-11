@@ -58,12 +58,30 @@ def run_tests_with_mcp(
     
     try:
         response = requests.post(url, json=payload)
-        response.raise_for_status()
+        response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
         return response.json()
-    except requests.RequestException as e:
+    except requests.exceptions.HTTPError as http_err:
+        # Handle specific HTTP errors (like 4xx, 5xx)
         return {
+            "success": False,
             "status": "error",
-            "summary": f"Error connecting to MCP Test Server: {str(e)}",
+            "message": f"HTTP error occurred: {http_err}",
+            "details": response.text if 'response' in locals() else str(http_err)
+        }
+    except requests.exceptions.RequestException as req_err:
+        # Handle other connection errors (DNS failure, refused connection, etc.)
+        return {
+            "success": False, 
+            "status": "error",
+            "message": f"Error connecting to MCP Test Server: {req_err}",
+            "details": str(req_err)
+        }
+    except Exception as e:
+        # Catch any other unexpected errors
+        return {
+            "success": False,
+            "status": "error",
+            "message": f"An unexpected error occurred: {e}",
             "details": str(e)
         }
 
@@ -72,7 +90,12 @@ def get_last_failed_tests_with_mcp() -> Dict[str, Any]:
     """
     Get the list of last failed tests
     """
-    url = f"{MCP_TEST_SERVER_URL}/last-failed"
+    # Need project_path for the server endpoint
+    # This tool might need refinement if project_path isn't available
+    # For now, let's assume it needs to be passed or configured
+    # Placeholder - this needs a project_path ideally!
+    project_path = "." # Or get from config/context? 
+    url = f"{MCP_TEST_SERVER_URL}/last-failed?project_path={project_path}" 
     
     try:
         response = requests.get(url)
@@ -81,10 +104,23 @@ def get_last_failed_tests_with_mcp() -> Dict[str, Any]:
             "success": True,
             "failed_tests": response.json()
         }
-    except requests.RequestException as e:
+    except requests.exceptions.HTTPError as http_err:
         return {
             "success": False,
-            "message": f"Error getting last failed tests: {str(e)}"
+            "message": f"HTTP error getting last failed tests: {http_err}",
+            "details": response.text if 'response' in locals() else str(http_err)
+        }
+    except requests.exceptions.RequestException as req_err:
+        return {
+            "success": False,
+            "message": f"Error connecting for last failed tests: {req_err}",
+            "details": str(req_err)
+        }
+    except Exception as e:
+         return {
+            "success": False,
+            "message": f"An unexpected error occurred: {e}",
+            "details": str(e)
         }
 
 
@@ -97,11 +133,34 @@ def get_test_result_with_mcp(result_id: str) -> Dict[str, Any]:
     try:
         response = requests.get(url)
         response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
+        # Assuming success returns the JSON directly
+        return response.json() 
+    except requests.exceptions.HTTPError as http_err:
+        status_code = http_err.response.status_code
+        error_detail = response.text if 'response' in locals() else str(http_err)
+        if status_code == 404:
+            message = f"Test result '{result_id}' not found."
+        else:
+            message = f"HTTP error retrieving test result: {http_err}"
+            
         return {
+            "success": False,
             "status": "error",
-            "summary": f"Error retrieving test result: {str(e)}",
+            "message": message,
+            "details": error_detail
+        }
+    except requests.exceptions.RequestException as req_err:
+        return {
+            "success": False,
+            "status": "error",
+            "message": f"Error connecting to retrieve test result: {req_err}",
+            "details": str(req_err)
+        }
+    except Exception as e:
+         return {
+            "success": False,
+            "status": "error",
+            "message": f"An unexpected error occurred: {e}",
             "details": str(e)
         }
 

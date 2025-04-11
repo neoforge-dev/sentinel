@@ -13,7 +13,7 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 # Import the functions from register_mcps
-from examples.register_mcps import setup_agent, print_available_tools
+from examples.register_mcps import setup_agent, print_available_tools, main as register_mcps_main
 
 
 class MockOllamaAgent:
@@ -28,6 +28,10 @@ class MockOllamaAgent:
     def register_tool(self, tool_config):
         """Mock tool registration"""
         self.tools[tool_config.name] = tool_config
+
+    def execute_tool(self, tool_name, params):
+        # Mock execution logic if needed
+        pass
 
 
 @pytest.fixture
@@ -106,44 +110,48 @@ def test_print_available_tools(mock_agent, capsys):
     assert "- other_tool: Some other tool" in output
 
 
+# Mock Response for requests.get
+class MockResponse:
+    def __init__(self, status_code):
+        self.status_code = status_code
+
+
 @patch("examples.register_mcps.setup_agent")
-@patch("examples.register_mcps.print_available_tools")
-@patch("examples.register_mcps.requests.get")
-def test_main_function(mock_requests, mock_print, mock_setup, mock_agent):
-    """Test the main function with mocked server checks"""
-    # Mock the agent setup
-    mock_setup.return_value = mock_agent
+@patch("requests.get")
+@patch("examples.register_mcps.print")
+def test_main_function(mock_print, mock_requests_get, mock_setup_agent, mock_agent):
+    """Test the main function to ensure it initializes the agent and checks servers."""
     
-    # Mock the requests.get responses
-    def mock_get_response(url):
-        """Return success for both MCP servers"""
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        return mock_response
+    # Configure mocks
+    mock_setup_agent.return_value = mock_agent # Return the mock agent
+    mock_requests_get.return_value = MockResponse(200) # Mock successful server checks
     
-    mock_requests.side_effect = mock_get_response
+    # Set environment variables if needed (or assume defaults)
+    # os.environ["MCP_CODE_SERVER_URL"] = "http://mock-code-server"
+    # os.environ["MCP_TEST_SERVER_URL"] = "http://mock-test-server"
+
+    # Call the main function
+    # Use try-except to catch SystemExit from argparse if needed, or use specific args
+    with patch('sys.argv', ['register_mcps.py']): # Mock sys.argv
+        returned_agent = register_mcps_main()
+
+    # Assertions
+    mock_setup_agent.assert_called_once_with(model="mistral:7b", mcp_enabled=True)
+    assert mock_requests_get.call_count == 2 # Check both servers
+    # Check the URLs called
+    expected_urls = [
+        f"http://localhost:8081", # Default code server URL
+        f"http://localhost:8082"  # Default test server URL
+    ]
+    actual_urls = [call.args[0] for call in mock_requests_get.call_args_list]
+    assert sorted(actual_urls) == sorted(expected_urls)
     
-    # Import and patch the main function
-    with patch("examples.register_mcps.main") as mock_main:
-        mock_main.return_value = mock_agent
-        
-        # Import the module
-        import examples.register_mcps
-        
-        # Call the patched main function
-        agent = mock_main()
-        
-        # Verify setup_agent was called
-        mock_setup.assert_called_once()
-        
-        # Verify tools were printed
-        mock_print.assert_called_once_with(mock_agent)
-        
-        # Verify server checks
-        assert mock_requests.call_count == 2
+    assert returned_agent == mock_agent # Ensure the configured agent is returned
     
-    # Verify the agent was returned
-    assert agent == mock_agent
+    # Check print calls if necessary (e.g., verify server status messages)
+    # print(mock_print.call_args_list)
+    assert any("Code MCP Server: Connected" in call.args[0] for call in mock_print.call_args_list)
+    assert any("Test MCP Server: Connected" in call.args[0] for call in mock_print.call_args_list)
 
 
 if __name__ == "__main__":

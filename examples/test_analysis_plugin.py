@@ -97,32 +97,32 @@ def run_tests(
 
 def get_test_result(test_id: str) -> Dict[str, Any]:
     """
-    Get the result of a previously run test by its ID.
-    
-    Args:
-        test_id: ID of the test result to retrieve
-        
-    Returns:
-        Dict containing the test results
+    Get the result of a previously run test by its ID
     """
+    # Use /results/ endpoint
+    url = f"{MCP_TEST_SERVER_URL}/results/{test_id}" 
+    
     try:
-        response = requests.get(f"{MCP_TEST_SERVER_URL}/test_result/{test_id}")
-        
-        if response.status_code != 200:
-            return {
-                "success": False,
-                "error": f"Error {response.status_code}: {response.text}"
-            }
-            
-        result = response.json()
+        response = requests.get(url)
+        response.raise_for_status()
         return {
             "success": True,
-            "result": result
+            "result": response.json()
+        }
+    except requests.exceptions.HTTPError as http_err:
+        return {
+            "success": False,
+            "error": f"HTTP error occurred: {http_err}"
+        }
+    except requests.exceptions.RequestException as req_err:
+        return {
+            "success": False,
+            "error": f"Request error occurred: {req_err}"
         }
     except Exception as e:
         return {
             "success": False,
-            "error": f"Exception: {str(e)}"
+            "error": f"Exception occurred: {str(e)}"
         }
 
 def list_test_results() -> Dict[str, Any]:

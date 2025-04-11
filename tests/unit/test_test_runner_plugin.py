@@ -9,7 +9,9 @@ import json
 import tempfile
 import shutil
 import pytest
-from unittest.mock import patch, MagicMock
+import unittest
+from unittest.mock import patch, MagicMock, call, mock_open
+import requests
 
 # Add the parent directory to the path so we can import the modules
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
@@ -125,9 +127,10 @@ def test_run_tests_success(mock_post):
 
 @patch("examples.test_runner_plugin.requests.post")
 def test_run_tests_error(mock_post):
-    """Test test execution with a server error"""
-    # Mock a server error
-    mock_post.side_effect = Exception("Connection error")
+    """Test test execution with a connection error"""
+    # Mock a connection error
+    error_message = "Connection error"
+    mock_post.side_effect = requests.RequestException(error_message)
     
     # Call the function and check it handles the error
     result = run_tests_with_mcp(
@@ -135,9 +138,12 @@ def test_run_tests_error(mock_post):
         test_path="tests"
     )
     
-    # Verify the error is handled
+    # Verify the error structure: {success: False, status: 'error', message: ..., details: ...}
+    assert result["success"] is False
     assert result["status"] == "error"
-    assert "Error connecting to MCP Test Server" in result["summary"]
+    assert error_message in result["message"] 
+    assert error_message in result["details"]
+    assert "summary" not in result # Ensure summary isn't present on error
 
 
 @patch("examples.test_runner_plugin.requests.get")
@@ -156,24 +162,28 @@ def test_get_last_failed_tests_success(mock_get):
     assert result["success"] is True
     assert result["failed_tests"] == mock_data
     
-    # Verify the request
+    # Verify the request URL (ignoring query params for simplicity for now)
     mock_get.assert_called_once()
     args = mock_get.call_args[0]
-    assert args[0].endswith("/last-failed")
+    # Check that the base URL ends with /last-failed
+    base_url = args[0].split('?')[0] 
+    assert base_url.endswith("/last-failed")
 
 
 @patch("examples.test_runner_plugin.requests.get")
 def test_get_last_failed_tests_error(mock_get):
-    """Test getting the last failed tests with a server error"""
-    # Mock a server error
-    mock_get.side_effect = Exception("Connection error")
+    """Test getting the last failed tests with a connection error"""
+    # Mock a connection error
+    error_message = "Connection error"
+    mock_get.side_effect = requests.RequestException(error_message)
     
     # Call the function and check it handles the error
     result = get_last_failed_tests_with_mcp()
     
     # Verify the error is handled
     assert result["success"] is False
-    assert "Error getting last failed tests" in result["message"]
+    # Check the specific message for connection errors
+    assert f"Error connecting for last failed tests: {error_message}" in result["message"]
 
 
 @patch("examples.test_runner_plugin.requests.get")
@@ -209,16 +219,20 @@ def test_get_test_result_success(mock_get):
 
 @patch("examples.test_runner_plugin.requests.get")
 def test_get_test_result_error(mock_get):
-    """Test getting a test result with a server error"""
-    # Mock a server error
-    mock_get.side_effect = Exception("Connection error")
+    """Test getting a test result with a connection error"""
+    # Mock a connection error
+    error_message = "Connection error"
+    mock_get.side_effect = requests.RequestException(error_message)
     
     # Call the function and check it handles the error
     result = get_test_result_with_mcp("test-result-123")
     
-    # Verify the error is handled
+    # Verify the error structure: {success: False, status: 'error', message: ..., details: ...}
+    assert result["success"] is False
     assert result["status"] == "error"
-    assert "Error retrieving test result" in result["summary"]
+    assert error_message in result["message"]
+    assert error_message in result["details"]
+    assert "summary" not in result # Ensure summary isn't present on error
 
 
 @patch("examples.test_runner_plugin.get_last_failed_tests_with_mcp")
@@ -263,56 +277,80 @@ def test_test_fix_error_getting_failed_tests(mock_get_failed):
     assert "Error getting failed tests" in result["message"]
 
 
-@patch("examples.test_runner_plugin.get_last_failed_tests_with_mcp")
-@patch("examples.test_runner_plugin.run_tests_with_mcp")
-@patch("examples.test_runner_plugin.os.path.exists")
-@patch("examples.test_runner_plugin.os.path.isabs")
-@patch("tempfile.mkstemp")
-@patch("os.close")
-@patch("shutil.copy2")
-@patch("builtins.open", new_callable=MagicMock)
-def test_test_fix_success(mock_open, mock_copy, mock_close, mock_mkstemp, 
-                          mock_isabs, mock_exists, mock_run_tests, mock_get_failed):
-    """Test test_fix_code with a successful fix"""
-    # Mock file path checks
-    mock_isabs.return_value = True
-    mock_exists.return_value = True
-    
-    # Mock tempfile creation
-    mock_mkstemp.return_value = (5, "/tmp/backup.py.bak")
-    
-    # Mock failed tests
-    mock_get_failed.return_value = {
-        "success": True,
-        "failed_tests": ["test_one", "test_two"]
-    }
-    
-    # Mock successful test run after fix
-    mock_run_tests.return_value = {
-        "status": "success",
-        "summary": "All tests passed",
-        "passed_tests": ["test_one", "test_two"],
-        "failed_tests": []
-    }
-    
-    # Call the function
-    result = test_fix_code(
-        code="def fixed_function():\n    return True",
-        file_path="/tmp/project/test_file.py",
-        project_path="/tmp/project"
-    )
-    
-    # Verify the result
-    assert result["code_fixed_the_issue"] is True
-    assert result["file_tested"] == "/tmp/project/test_file.py"
-    assert result["fixed_tests"] == ["test_one", "test_two"]
-    assert result["still_failing_tests"] == []
-    
-    # Verify the file was opened for writing
-    mock_open.assert_called_with("/tmp/project/test_file.py", "w")
-    
-    # Verify the backup was created and restored
-    mock_copy.assert_called()
+class TestTestRunnerPluginTests(unittest.TestCase):
+    @patch('examples.test_runner_plugin.run_tests_with_mcp')
+    @patch('os.path.exists')
+    @patch('tempfile.mkstemp')
+    @patch('os.close')
+    @patch('shutil.copy2')
+    @patch('builtins.open', new_callable=mock_open)
+    @patch('os.unlink')
+    def test_test_fix_success(self, mock_unlink, mock_open_func, mock_copy, mock_close, mock_mkstemp, mock_exists, mock_run_tests):
+        """Test the test_fix_code function with a successful fix test."""
+        # Configure mocks
+        mock_exists.return_value = True
+        mock_mkstemp.return_value = (123, "/tmp/backup.py.bak")
+        
+        # Mock run_tests results
+        mock_run_tests.return_value = {
+            "success": True,
+            "status": "success",
+            "summary": "All tests passed after fix",
+            "failed_tests": [],
+            "id": "fix-test-run-123",
+            "details": "...",
+            "passed_tests": ["test_one", "test_two"],
+            "skipped_tests": []
+        }
+        
+        # Mock get_last_failed_tests
+        with patch('examples.test_runner_plugin.get_last_failed_tests_with_mcp') as mock_get_failed:
+            mock_get_failed.return_value = {
+                "success": True,
+                "failed_tests": ["test_one", "test_two"]
+            }
+
+            # Define inputs
+            fixed_code = "def fixed_function(): return True"
+            file_path = "src/my_module.py"
+            project_path = "/abs/path/to/project"
+            full_file_path = os.path.join(project_path, file_path)
+            backup_file_path = "/tmp/backup.py.bak"
+
+            # Call the function
+            result = test_fix_code(code=fixed_code, file_path=file_path, project_path=project_path)
+
+            # Assertions
+            mock_get_failed.assert_called_once()
+            assert call(full_file_path) in mock_exists.call_args_list
+            assert call(backup_file_path) in mock_exists.call_args_list
+            assert mock_exists.call_count == 2
+            
+            mock_mkstemp.assert_called_once()
+            mock_close.assert_called_once_with(123)
+            mock_copy.assert_has_calls([
+                call(full_file_path, backup_file_path),
+                call(backup_file_path, full_file_path)
+            ], any_order=False)
+
+            mock_open_func.assert_called_once_with(full_file_path, 'w')
+            mock_open_func().write.assert_called_once_with(fixed_code)
+            mock_run_tests.assert_called_once_with(
+                project_path=project_path,
+                test_path="",
+                runner="pytest",
+                max_failures=None,
+                run_last_failed=True,
+                max_tokens=6000
+            )
+            mock_unlink.assert_called_once_with(backup_file_path)
+            
+            assert result["success"] is True
+            assert result["status"] == "success"
+            assert result["code_fixed_the_issue"] is True
+            assert result["file_tested"] == file_path
+            assert result["fixed_tests"] == ["test_one", "test_two"]
+            assert result["still_failing_tests"] == []
 
 
 @patch("examples.test_runner_plugin.get_last_failed_tests_with_mcp")

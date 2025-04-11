@@ -39,3 +39,17 @@ def initialize_test_database():
 
     # Optional: Cleanup after session if needed, though often test DBs are left
     # print("\nTest session finished.") 
+
+@pytest.fixture(scope="session")
+def sample_project_path(tmp_path_factory):
+    """Fixture to create a temporary sample project directory with dummy test files."""
+    # Create a base temporary directory for the session
+    base_temp = tmp_path_factory.mktemp("sample_project_session")
+    
+    # Create dummy test files required by tests
+    (base_temp / "test_passing.py").write_text("def test_always_passes(): assert True")
+    (base_temp / "test_failing.py").write_text("def test_always_fails(): assert False")
+    # Add any other required files/structure here
+    
+    print(f"\nCreated sample project directory with tests: {base_temp}")
+    return base_temp 

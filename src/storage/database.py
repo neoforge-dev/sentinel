@@ -17,6 +17,7 @@ import aiosqlite
 import json
 import logging
 import os
+from pathlib import Path
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
@@ -24,8 +25,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mcp.database")
 
+# Get project root directory
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
 # Default database location
-DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "../../data/mcp.db")
+DEFAULT_DB_PATH = os.path.join(PROJECT_ROOT, "data", "mcp.db")
 DB_PATH = os.environ.get("MCP_DB_PATH", DEFAULT_DB_PATH)
 
 # Ensure the data directory exists
@@ -94,20 +98,15 @@ class DatabaseManager:
         await self.conn.execute("""
         CREATE TABLE IF NOT EXISTS test_results (
             id TEXT PRIMARY KEY,
-            timestamp REAL NOT NULL,
             status TEXT NOT NULL,
             summary TEXT NOT NULL,
-            execution_time REAL,
-            project_path TEXT,
-            test_path TEXT,
-            runner TEXT,
-            mode TEXT,
-            max_failures INTEGER,
-            run_last_failed BOOLEAN,
-            timeout INTEGER,
-            max_tokens INTEGER,
-            docker_image TEXT,
-            additional_args TEXT
+            details TEXT NOT NULL,
+            passed_tests TEXT NOT NULL,
+            failed_tests TEXT NOT NULL,
+            skipped_tests TEXT NOT NULL,
+            execution_time REAL NOT NULL,
+            config TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
         
@@ -174,186 +173,119 @@ class DatabaseManager:
     
     # Test Results Methods
     
-    async def store_test_result(self, result_id: str, status: str, summary: str, 
-                               details: str, passed_tests: List[str], 
-                               failed_tests: List[Tuple[str, str]], 
-                               skipped_tests: List[str], 
-                               execution_time: float, config: Dict[str, Any]) -> None:
-        """
-        Store a test execution result in the database.
-        
-        Args:
-            result_id: Unique identifier for the test result
-            status: Status of the test run (success, failure, error)
-            summary: Summary of the test execution
-            details: Detailed output from the test execution
-            passed_tests: List of tests that passed
-            failed_tests: List of failed tests with their error messages
-            skipped_tests: List of tests that were skipped
-            execution_time: Time taken to execute the tests (in seconds)
-            config: Configuration used for the test execution
-        """
+    async def store_test_result(
+        self,
+        result_id: str,
+        status: str,
+        summary: str,
+        details: str,
+        passed_tests: list,
+        failed_tests: list,
+        skipped_tests: list,
+        execution_time: float,
+        config: dict
+    ) -> None:
+        """Store a test execution result in the database."""
         if not self.conn:
             await self.connect()
         
-        # Store the test result
+        # Ensure all list fields are properly serialized
+        passed_tests_json = json.dumps(passed_tests)
+        failed_tests_json = json.dumps(failed_tests)
+        skipped_tests_json = json.dumps(skipped_tests)
+        config_json = json.dumps(config)
+        
         await self.conn.execute(
             """
-            INSERT INTO test_results 
-            (id, timestamp, status, summary, execution_time, project_path, test_path, 
-            runner, mode, max_failures, run_last_failed, timeout, max_tokens, 
-            docker_image, additional_args)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO test_results (
+                id, status, summary, details, 
+                passed_tests, failed_tests, skipped_tests,
+                execution_time, config
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                result_id,
-                time.time(),
-                status,
-                summary,
+                result_id, status, summary, details,
+                passed_tests_json,
+                failed_tests_json,
+                skipped_tests_json,
                 execution_time,
-                config.get("project_path", ""),
-                config.get("test_path", ""),
-                config.get("runner", ""),
-                config.get("mode", ""),
-                config.get("max_failures", None),
-                config.get("run_last_failed", False),
-                config.get("timeout", None),
-                config.get("max_tokens", None),
-                config.get("docker_image", ""),
-                json.dumps(config.get("additional_args", {}))
+                config_json
             )
         )
-        
-        # Store passed tests
-        for test_name in passed_tests:
-            await self.conn.execute(
-                """
-                INSERT INTO test_details (id, test_result_id, test_type, test_name)
-                VALUES (?, ?, ?, ?)
-                """,
-                (f"{result_id}_{test_name}_passed", result_id, "passed", test_name)
-            )
-        
-        # Store failed tests
-        for test_name, error_msg in failed_tests:
-            await self.conn.execute(
-                """
-                INSERT INTO test_details (id, test_result_id, test_type, test_name, details)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (f"{result_id}_{test_name}_failed", result_id, "failed", test_name, error_msg)
-            )
-            
-            # Update last failed tests
-            await self.conn.execute(
-                """
-                INSERT OR REPLACE INTO last_failed_tests (test_name, timestamp)
-                VALUES (?, ?)
-                """,
-                (test_name, time.time())
-            )
-        
-        # Store skipped tests
-        for test_name in skipped_tests:
-            await self.conn.execute(
-                """
-                INSERT INTO test_details (id, test_result_id, test_type, test_name)
-                VALUES (?, ?, ?, ?)
-                """,
-                (f"{result_id}_{test_name}_skipped", result_id, "skipped", test_name)
-            )
-        
         await self.conn.commit()
         logger.info(f"Stored test result with ID: {result_id}")
-    
-    async def get_test_result(self, result_id: str) -> Dict[str, Any]:
-        """
-        Retrieve a test result by its ID.
-        
-        Args:
-            result_id: The ID of the test result to retrieve
-            
-        Returns:
-            A dictionary containing the test result information
-        """
+
+    async def get_test_result(self, result_id: str) -> Optional[dict]:
+        """Retrieve a test result by its ID."""
         if not self.conn:
             await self.connect()
         
-        # Get the test result
         async with self.conn.execute(
-            "SELECT * FROM test_results WHERE id = ?", (result_id,)
-        ) as cursor:
-            result = await cursor.fetchone()
-            
-            if not result:
-                return None
-            
-            column_names = [col[0] for col in cursor.description]
-            result_dict = dict(zip(column_names, result))
-            
-            # Convert additional_args back to dict if it exists
-            if result_dict.get("additional_args"):
-                result_dict["additional_args"] = json.loads(result_dict["additional_args"])
-        
-        # Get test details
-        passed_tests = []
-        failed_tests = []
-        skipped_tests = []
-        
-        async with self.conn.execute(
-            "SELECT test_type, test_name, details FROM test_details WHERE test_result_id = ?",
+            "SELECT * FROM test_results WHERE id = ?",
             (result_id,)
         ) as cursor:
-            details = await cursor.fetchall()
+            row = await cursor.fetchone()
+            if not row:
+                logger.warning(f"Test result not found: {result_id}")
+                return None
             
-            for test_type, test_name, error_msg in details:
-                if test_type == "passed":
-                    passed_tests.append(test_name)
-                elif test_type == "failed":
-                    failed_tests.append((test_name, error_msg))
-                elif test_type == "skipped":
-                    skipped_tests.append(test_name)
-        
-        # Combine everything into a complete result
-        complete_result = {
-            **result_dict,
-            "passed_tests": passed_tests,
-            "failed_tests": failed_tests,
-            "skipped_tests": skipped_tests
-        }
-        
-        return complete_result
+            # Get column names from cursor description
+            columns = [col[0] for col in cursor.description]
+            result = dict(zip(columns, row))
+            
+            # Deserialize JSON fields
+            result["passed_tests"] = json.loads(result["passed_tests"])
+            result["failed_tests"] = json.loads(result["failed_tests"])
+            result["skipped_tests"] = json.loads(result["skipped_tests"])
+            result["config"] = json.loads(result["config"])
+            
+            logger.info(f"Retrieved test result with ID: {result_id}")
+            return result
     
     async def list_test_results(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """
-        List recent test results.
-        
-        Args:
-            limit: Maximum number of results to return (default: 10)
-            
-        Returns:
-            A list of dictionaries containing basic test result information
-        """
+        """List recent test results."""
         if not self.conn:
             await self.connect()
         
-        results = []
         async with self.conn.execute(
             """
-            SELECT id, timestamp, status, summary, execution_time 
+            SELECT 
+                id, 
+                status, 
+                summary, 
+                details, 
+                passed_tests, 
+                failed_tests, 
+                skipped_tests, 
+                execution_time, 
+                config,
+                created_at 
             FROM test_results 
-            ORDER BY timestamp DESC 
+            ORDER BY created_at DESC 
             LIMIT ?
             """,
             (limit,)
         ) as cursor:
-            rows = await cursor.fetchall()
-            column_names = [col[0] for col in cursor.description]
+            results = await cursor.fetchall()
             
-            for row in rows:
-                results.append(dict(zip(column_names, row)))
-        
-        return results
+            # Convert rows to dictionaries and parse JSON fields
+            result_list = []
+            for row in results:
+                result_dict = {
+                    "id": row[0],
+                    "status": row[1],
+                    "summary": row[2],
+                    "details": row[3],
+                    "passed_tests": json.loads(row[4]),
+                    "failed_tests": json.loads(row[5]),
+                    "skipped_tests": json.loads(row[6]),
+                    "execution_time": row[7],
+                    "config": json.loads(row[8]),
+                    "created_at": row[9] # Use the correct index for created_at
+                }
+                result_list.append(result_dict)
+            return result_list
     
     async def get_last_failed_tests(self) -> List[str]:
         """

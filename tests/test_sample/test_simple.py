@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
-"""Simple test file for testing the MCP test server."""
+"""Simple test file with passing and failing tests."""
 
-import unittest
+import pytest
 
+def test_passing():
+    """A test that passes."""
+    assert 2 + 2 == 4
+    assert True is True
+    assert False is False
 
-class SimpleTest(unittest.TestCase):
-    """A simple test class with passing and failing tests."""
+def test_another_passing():
+    """Another test that passes."""
+    assert "hello world".split() == ["hello", "world"]
+    assert "hello" in "hello world"
 
-    def test_passing_test(self):
-        """A test that always passes."""
-        self.assertEqual(2 + 2, 4)
-        self.assertTrue(True)
-        self.assertFalse(False)
+def test_failing():
+    """A test that fails."""
+    assert 2 + 2 == 5, "This test is designed to fail"
 
-    def test_another_passing_test(self):
-        """Another test that always passes."""
-        self.assertEqual("hello world".split(), ["hello", "world"])
-        self.assertIn("hello", "hello world")
-
-    def test_failing_test(self):
-        """A test that always fails."""
-        self.assertEqual(2 + 2, 5)  # This will fail
-
-    def test_error_test(self):
-        """A test that raises an error."""
-        raise ValueError("This test raises an error on purpose") 
+def test_error():
+    """A test that raises an error."""
+    raise ValueError("This test raises an error on purpose") 
