@@ -20,7 +20,8 @@ from examples.code_analysis_plugin import (
     format_code_with_mcp,
     store_snippet_with_mcp,
     register_code_tools,
-    MCP_CODE_SERVER_URL # Import URL for checking calls
+    MCP_CODE_SERVER_URL, # Import URL for checking calls
+    _get_headers # Import helper for testing
 )
 from agents.agent import ToolConfig # Import ToolConfig for verification
 
@@ -59,36 +60,43 @@ def mock_agent():
     return MockOllamaAgent()
 
 
-@patch("examples.code_analysis_plugin.requests.post")
+# Mock URL
+MOCK_URL = "http://mock-mcp-code-server:8081" # Ensure port matches plugin default or test env
+MOCK_API_KEY = "test-agent-key"
+
+# Mock the requests library
+@patch('requests.post')
 def test_analyze_code_success(mock_post):
-    """Test successful code analysis"""
+    """Test analyze_code_with_mcp successful call."""
+    expected_headers = {"Content-Type": "application/json", "X-API-Key": MOCK_API_KEY}
     mock_response = MagicMock()
     mock_response.status_code = 200
-    mock_response.json.return_value = {
-        "success": True,
-        "issues": [{"line": 1}],
-        "formatted_code": "formatted code"
-    }
-    mock_response.raise_for_status = MagicMock()
+    mock_response.json.return_value = {"success": True, "issues": []}
     mock_post.return_value = mock_response
     
-    result = analyze_code_with_mcp("test code")
+    result = analyze_code_with_mcp("print('hello')")
     
     mock_post.assert_called_once_with(
-        f"{MCP_CODE_SERVER_URL}/analyze",
-        json={"code": "test code", "language": "python"}
+        url=f"{MOCK_URL}/analyze", 
+        json={"code": "print('hello')", "language": "python", "filename": None},
+        headers=expected_headers # Verify headers
     )
-    assert result == {
-        "success": True,
-        "issues": [{"line": 1}],
-        "formatted_code": "formatted code"
-    }
+    assert result["success"] == True
 
 
-@patch("examples.code_analysis_plugin.requests.post")
-def test_analyze_code_connection_error(mock_post):
-    """Test code analysis connection error"""
-    mock_post.side_effect = requests.RequestException("Connection failed")
+@patch('requests.post')
+@patch.dict(os.environ, {"AGENT_API_KEY": ""}) # Test without API key
+def test_analyze_code_no_api_key(mock_post):
+    """Test analyze_code_with_mcp without API key header."""
+    expected_headers = {"Content-Type": "application/json"} # No X-API-Key
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"success": True, "issues": []}
+    mock_post.return_value = mock_response
+    
+    # Call the function (need to reload the module or patch the global API_KEY)
+    import importlib
+    importlib.reload(code_analysis_plugin)
     
     result = analyze_code_with_mcp("test code")
     

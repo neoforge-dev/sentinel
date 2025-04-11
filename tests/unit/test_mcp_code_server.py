@@ -21,18 +21,30 @@ from agents.mcp_code_server import app
 # Directly import database components - assume they exist when testing
 from src.storage.database import DatabaseManager, get_db_manager
 
+# Import security dependency
+try:
+    from src.security import verify_api_key, EXPECTED_API_KEY
+except ImportError:
+    # Define dummies if import fails
+    async def verify_api_key(): pass
+    EXPECTED_API_KEY = "dev_secret_key" # Ensure this matches the default used
+
 # Create a test client
 client = TestClient(app)
 
 # Synchronous client fixture (useful for simple tests)
 @pytest.fixture(scope="module")
 def client_sync():
-    return TestClient(app)
+    # Add default valid API key header to sync client
+    headers = {"X-API-Key": EXPECTED_API_KEY}
+    return TestClient(app, headers=headers)
 
 # Asynchronous client fixture (needed for async endpoints)
 @pytest_asyncio.fixture(scope="function") # Use function scope for client
 async def client_async():
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+    # Add default valid API key header to async client
+    headers = {"X-API-Key": EXPECTED_API_KEY}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver", headers=headers) as client:
         yield client
 
 # Fixture for overriding DB dependency
@@ -54,6 +66,22 @@ def override_get_db_manager(mock_db_manager):
     # Store original overrides if any
     original_overrides = app.dependency_overrides.copy()
     app.dependency_overrides[get_db_manager] = _override_get_db
+    yield
+    # Restore original overrides
+    app.dependency_overrides = original_overrides
+
+# Override verify_api_key dependency (optional, can test actual dependency too)
+@pytest.fixture(autouse=True)
+def override_verify_api_key_dependency():
+    """Override the verify_api_key dependency for most tests."""
+    async def _override_verify():
+        # Simple override that always passes, returns a dummy key
+        return "test_key"
+    
+    # Store original overrides if any
+    original_overrides = app.dependency_overrides.copy()
+    # Target the actual verify_api_key function imported
+    app.dependency_overrides[verify_api_key] = _override_verify
     yield
     # Restore original overrides
     app.dependency_overrides = original_overrides
@@ -289,6 +317,43 @@ async def test_get_all_snippets(client_async, mock_db_manager):
 # 
 # def test_fix_code_no_fix():
 #     ...
+
+
+# --- Authentication Tests ---
+
+def test_missing_api_key(): # Use raw TestClient
+    """Test request without API key header fails with 401."""
+    raw_client = TestClient(app) # Create client without default headers or overrides
+    response = raw_client.post("/analyze", json={"code": "print(1)"})
+    assert response.status_code == 401
+    assert "missing api key" in response.json()["detail"].lower()
+
+def test_invalid_api_key(): # Use raw TestClient
+    """Test request with invalid API key header fails with 401."""
+    raw_client = TestClient(app) # Create client without default headers or overrides
+    headers = {"X-API-Key": "invalid-key"}
+    response = raw_client.post("/analyze", json={"code": "print(1)"}, headers=headers)
+    assert response.status_code == 401
+    assert "invalid api key" in response.json()["detail"].lower()
+
+@pytest.mark.asyncio
+async def test_async_missing_api_key(): # Use raw AsyncClient
+    """Test async request without API key header fails with 401."""
+    # Create raw client without default headers or overrides
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as raw_client:
+        response = await raw_client.post("/snippets", json={"code": "c", "language": "py"})
+    assert response.status_code == 401
+    assert "missing api key" in response.json()["detail"].lower()
+
+@pytest.mark.asyncio
+async def test_async_invalid_api_key(): # Use raw AsyncClient
+    """Test async request with invalid API key header fails with 401."""
+    # Create raw client without default headers or overrides
+    headers = {"X-API-Key": "invalid-key"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as raw_client:
+        response = await raw_client.post("/snippets", json={"code": "c", "language": "py"}, headers=headers)
+    assert response.status_code == 401
+    assert "invalid api key" in response.json()["detail"].lower()
 
 
 if __name__ == "__main__":

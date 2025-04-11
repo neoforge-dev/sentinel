@@ -15,6 +15,7 @@ import shutil
 from datetime import datetime
 import uvicorn
 from httpx import AsyncClient, ASGITransport
+import unittest
 
 # Add the parent directory to the path so we can import the modules
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
@@ -35,6 +36,14 @@ from agents.mcp_test_server import (
 # sys.path.append(str(Path(__file__).resolve().parent.parent))
 # No longer needed with pytest.ini configuration
 from src.storage.database import get_db_manager, DatabaseManager
+
+# Import security dependency
+try:
+    from src.security import verify_api_key, EXPECTED_API_KEY
+except ImportError:
+    # Define dummies if import fails
+    async def verify_api_key(): pass
+    EXPECTED_API_KEY = "dev_secret_key"
 
 # Create a test client
 client = TestClient(app)
@@ -440,6 +449,169 @@ def test_run_tests_invalid_path():
     }
     response = client_sync.post("/run-tests", json=config)
     assert response.status_code in [400, 422]
+
+
+# Synchronous test client
+@pytest.fixture(scope="module")
+def client_sync():
+    headers = {"X-API-Key": EXPECTED_API_KEY}
+    return TestClient(app, headers=headers)
+
+# Asynchronous test client
+@pytest_asyncio.fixture(scope="function")
+async def client_async():
+    headers = {"X-API-Key": EXPECTED_API_KEY}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver", headers=headers) as client:
+        yield client
+
+@pytest.mark.asyncio
+async def test_run_tests_local_success(client_async, mock_db_manager, sample_project_path, override_verify_api_key_dependency):
+    """Test running tests locally successfully."""
+    # client_async fixture has the header and override is active
+    # Configure mock DB manager
+    mock_db_manager.store_test_result.return_value = None
+    mock_db_manager.get_last_failed_tests.return_value = []
+
+    config = {
+        "project_path": str(sample_project_path),
+        "test_path": "test_passing.py", # Use the passing test
+        "runner": "pytest",
+        "mode": "local"
+    }
+    
+    # Mock subprocess call
+    with patch("asyncio.create_subprocess_exec") as mock_exec:
+        mock_process = AsyncMock()
+        # Simulate pytest success output (simplified)
+        mock_process.communicate.return_value = (b"collected 1 item\n test_passing.py::test_passes PASSED [100%]\n", b"")
+        mock_process.returncode = 0
+        mock_exec.return_value = mock_process
+
+        response = await client_async.post("/run-tests", json=config)
+
+        # Assertions
+        assert response.status_code == 200
+        result = response.json()
+        assert result["status"] == "success"
+        assert "test_passes" in result["passed_tests"][0]
+        mock_db_manager.store_test_result.assert_awaited_once()
+
+# ... (other pytest-style tests)
+
+# --- Authentication Tests ---
+
+def test_missing_api_key(): # Use raw client
+    """Test request without API key header fails with 401."""
+    raw_client = TestClient(app)
+    test_config = {"project_path": "/", "test_path": "t"}
+    response = raw_client.post("/run-tests", json=test_config)
+    assert response.status_code == 401
+    assert "missing api key" in response.json()["detail"].lower()
+
+def test_invalid_api_key(): # Use raw client
+    """Test request with invalid API key header fails with 401."""
+    raw_client = TestClient(app)
+    test_config = {"project_path": "/", "test_path": "t"}
+    headers = {"X-API-Key": "invalid-key"}
+    response = raw_client.post("/run-tests", json=test_config, headers=headers)
+    assert response.status_code == 401
+    assert "invalid api key" in response.json()["detail"].lower()
+
+@pytest.mark.asyncio
+async def test_async_missing_api_key(): # Use raw client
+    """Test async request without API key header fails with 401."""
+    test_config = {"project_path": "/", "test_path": "t"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as fresh_client:
+        response = await fresh_client.post("/run-tests", json=test_config)
+        assert response.status_code == 401
+
+@pytest.mark.asyncio
+async def test_async_invalid_api_key(): # Use raw client
+    """Test async request with invalid API key header fails with 401."""
+    test_config = {"project_path": "/", "test_path": "t"}
+    headers = {"X-API-Key": "invalid-key"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver", headers=headers) as fresh_client:
+        response = await fresh_client.post("/run-tests", json=test_config)
+        assert response.status_code == 401
+
+
+# Test list results with auth (using raw clients)
+@pytest.mark.asyncio
+async def test_list_results_auth(mock_db_manager):
+    """Test listing results requires auth (using raw clients)."""
+    # Test without key
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as fresh_client:
+        response_no_key = await fresh_client.get("/results")
+    # Test with invalid key
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver", headers={"X-API-Key": "bad"}) as fresh_client:
+        response_bad_key = await fresh_client.get("/results")
+    # Test with valid key (using raw client)
+    headers_good = {"X-API-Key": EXPECTED_API_KEY}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver", headers=headers_good) as fresh_client:
+        mock_db_manager.list_test_results = AsyncMock(return_value=[{"id": "res1"}])
+        response_good_key = await fresh_client.get("/results")
+
+    assert response_no_key.status_code == 401
+    assert response_bad_key.status_code == 401
+    assert response_good_key.status_code == 200
+    assert response_good_key.json() == ["res1"]
+
+
+# Mock filesystem structure fixture
+@pytest.fixture(scope="session")
+def sample_project_path(tmp_path_factory):
+    # ... (fixture implementation)
+
+# Override verify_api_key dependency for most tests
+@pytest.fixture(autouse=True)
+def override_verify_api_key_dependency(monkeypatch):
+    """Override the verify_api_key dependency for most tests."""
+    async def _override_verify():
+        # Simple override that always passes
+        return "test_key"
+    
+    # Use monkeypatch to replace the dependency in the app's context
+    # This is slightly different from dependency_overrides but achieves a similar goal
+    # We need to target where verify_api_key is imported in the server file
+    # monkeypatch.setattr("agents.mcp_test_server.verify_api_key", _override_verify) 
+    # Using dependency_overrides is generally preferred if possible
+    original_overrides = app.dependency_overrides.copy()
+    app.dependency_overrides[verify_api_key] = _override_verify
+    yield
+    app.dependency_overrides = original_overrides
+
+
+# -- Unittest-style tests (may need refactoring for fixtures/auth) --
+class TestMCPTestServer(unittest.TestCase):
+    # These likely need headers added or conversion to use pytest fixtures
+    @classmethod
+    def setUpClass(cls):
+        """Set up for test class."""
+        # Ensure the app uses the test database
+        os.environ['DATABASE_URL'] = 'sqlite+aiosqlite:///./test_mcp_test_unittest.db' # Use different DB for unittest
+        cls.client = TestClient(app) # Create a client instance for the class
+
+    @classmethod
+    def tearDownClass(cls):
+        """Tear down after test class."""
+        # Clean up the test database file
+        if os.path.exists("./test_mcp_test_unittest.db"):
+            os.remove("./test_mcp_test_unittest.db")
+
+    def test_root_endpoint_unittest(self):
+        """Test the root endpoint using unittest client."""
+        # Use raw client to test without override if needed, or add header
+        # This test will fail without the header or an override applied differently
+        raw_client = TestClient(app) # Create client without default headers or overrides
+        # Try without header first (should fail)
+        response_fail = raw_client.get("/")
+        self.assertEqual(response_fail.status_code, 401)
+
+        # Try with header
+        headers = {"X-API-Key": EXPECTED_API_KEY}
+        response_pass = raw_client.get("/", headers=headers)
+        self.assertEqual(response_pass.status_code, 200)
+        self.assertIn("MCP Test Server", response_pass.json()["service"])
 
 
 if __name__ == "__main__":

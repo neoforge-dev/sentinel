@@ -44,6 +44,13 @@ from fastapi.middleware.cors import CORSMiddleware
 # No longer needed with pytest.ini configuration
 from src.storage.database import get_db_manager, DatabaseManager
 
+# Import security dependency
+try:
+    from src.security import verify_api_key
+except ImportError as e:
+    logger.error(f"Failed to import security module: {e}. API key verification will be disabled.")
+    async def verify_api_key(): pass # Dummy dependency
+
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
@@ -638,13 +645,13 @@ async def run_tests_docker(config: TestExecutionConfig, db: DatabaseManager) -> 
 
 
 @app.get("/")
-async def root():
+async def root(api_key: str = Depends(verify_api_key)):
     """Root endpoint"""
     return {"status": "active", "service": "MCP Test Server"}
 
 
 @app.post("/run-tests", response_model=TestResult)
-async def run_tests_endpoint(config: TestExecutionConfig, db: DatabaseManager = Depends(get_db_manager)):
+async def run_tests_endpoint(config: TestExecutionConfig, db: DatabaseManager = Depends(get_db_manager), api_key: str = Depends(verify_api_key)):
     """Run tests with the given configuration (Endpoint wrapper)"""
     # Validate project path
     if not os.path.isdir(config.project_path):
@@ -669,7 +676,7 @@ async def run_tests_endpoint(config: TestExecutionConfig, db: DatabaseManager = 
 
 
 @app.get("/results/{result_id}", response_model=TestResult)
-async def get_test_result(result_id: str, db: DatabaseManager = Depends(get_db_manager)):
+async def get_test_result(result_id: str, db: DatabaseManager = Depends(get_db_manager), api_key: str = Depends(verify_api_key)):
     """Get the result of a previous test run"""
     result = await db.get_test_result(result_id)
     if not result:
@@ -679,14 +686,14 @@ async def get_test_result(result_id: str, db: DatabaseManager = Depends(get_db_m
 
 
 @app.get("/results", response_model=List[str])
-async def list_test_results(db: DatabaseManager = Depends(get_db_manager)):
+async def list_test_results(db: DatabaseManager = Depends(get_db_manager), api_key: str = Depends(verify_api_key)):
     """List all test result IDs"""
     results = await db.list_test_results()
     return [r["id"] for r in results]
 
 
 @app.get("/last-failed", response_model=List[str])
-async def get_last_failed_tests(project_path: str, db: DatabaseManager = Depends(get_db_manager)):
+async def get_last_failed_tests(project_path: str, db: DatabaseManager = Depends(get_db_manager), api_key: str = Depends(verify_api_key)):
     """Get the list of last failed tests"""
     failed_tests = await db.get_last_failed_tests(project_path)
     return failed_tests

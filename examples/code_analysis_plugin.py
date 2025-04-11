@@ -19,9 +19,27 @@ except ImportError:
     print("Error: Could not import from agents.agent. Make sure you're running from the project root.")
     sys.exit(1)
 
-# Default settings
-MCP_CODE_SERVER_URL = os.environ.get("MCP_CODE_SERVER_URL", "http://localhost:8081")
+try:
+    # Base URL for the MCP Code Server
+    MCP_CODE_SERVER_URL = os.environ.get("MCP_CODE_SERVER_URL", "http://localhost:8000")
+    # API Key for authentication
+    API_KEY = os.environ.get("AGENT_API_KEY") 
+    if not API_KEY:
+        print("Warning: AGENT_API_KEY environment variable not set for MCP communication.", file=sys.stderr)
+        # Set API_KEY to None or a default if needed, but None signals no key available
+        API_KEY = None 
 
+except Exception as e:
+    print(f"Error loading MCP configuration: {e}", file=sys.stderr)
+    MCP_CODE_SERVER_URL = "http://localhost:8000" # Default fallback
+    API_KEY = None
+
+def _get_headers() -> Dict[str, str]:
+    """Returns headers for MCP requests, including API key if available."""
+    headers = {"Content-Type": "application/json"}
+    if API_KEY:
+        headers["X-API-Key"] = API_KEY
+    return headers
 
 def analyze_code_with_mcp(code: str, language: str = "python") -> Dict[str, Any]:
     """
@@ -35,7 +53,7 @@ def analyze_code_with_mcp(code: str, language: str = "python") -> Dict[str, Any]
     }
     
     try:
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=_get_headers())
         response.raise_for_status()
         return response.json()
     except requests.RequestException as e:
@@ -84,7 +102,7 @@ def store_snippet_with_mcp(code: str, language: str = "python", snippet_id: Opti
     }
     
     try:
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=_get_headers())
         response.raise_for_status()
         return {"success": True, "id": snippet_id}
     except requests.RequestException as e:

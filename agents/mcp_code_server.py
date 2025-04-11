@@ -33,16 +33,19 @@ from pydantic import BaseModel, Field
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-# Import Database Components
+# Import Security and Database Components
 try:
     from src.storage.database import DatabaseManager, get_db_manager
-except ImportError:
-    print("Error: Could not import database components from src.storage.database")
-    # Provide a dummy implementation or raise error if DB is critical
+    from src.security import verify_api_key # Import the new dependency
+except ImportError as e:
+    # Log the specific import error
+    logger.error(f"Failed to import required modules: {e}. Ensure src directory is in PYTHONPATH.")
+    # Decide how to handle missing dependencies (exit, use dummies, etc.)
+    # For now, let's define dummies to allow basic server startup for inspection
     class DatabaseManager: pass
     async def get_db_manager(): return None
-    # Decide if server should proceed without DB
-    # sys.exit(1) 
+    async def verify_api_key(): pass # Dummy dependency
+    # sys.exit(1)
 
 # Set up logging
 logging.basicConfig(
@@ -274,8 +277,8 @@ async def root():
     """Root endpoint for health check."""
     return {"service": "MCP Code Server", "status": "active"}
 
-@app.post("/analyze")
-async def analyze_code(request: CodeAnalysisRequest, db: DatabaseManager = Depends(get_db_manager)):
+@app.post("/analyze", response_model=CodeAnalysisResult)
+async def analyze_code(request: CodeAnalysisRequest, db: DatabaseManager = Depends(get_db_manager), api_key: str = Depends(verify_api_key)):
     """Analyze code and return issues found."""
     if request.language == CodeLanguage.PYTHON:
         result = await analyze_python_code(request.code, request.filename)
@@ -297,8 +300,8 @@ async def analyze_code(request: CodeAnalysisRequest, db: DatabaseManager = Depen
         # In the future, we can add support for other languages
         return CodeAnalysisResult(issues=[], formatted_code=request.code)
 
-@app.post("/format")
-async def format_code(request: CodeFormatRequest, db: DatabaseManager = Depends(get_db_manager)):
+@app.post("/format", response_model=CodeAnalysisResult)
+async def format_code(request: CodeFormatRequest, db: DatabaseManager = Depends(get_db_manager), api_key: str = Depends(verify_api_key)):
     """Format code and return the formatted version."""
     if request.language == CodeLanguage.PYTHON:
         result = await analyze_python_code(request.code, request.filename)
@@ -338,7 +341,7 @@ async def format_code(request: CodeFormatRequest, db: DatabaseManager = Depends(
         return {"formatted_code": request.code}
 
 @app.post("/fix")
-async def fix_code(request: CodeAnalysisRequest, db: DatabaseManager = Depends(get_db_manager)):
+async def fix_code(request: CodeAnalysisRequest, db: DatabaseManager = Depends(get_db_manager), api_key: str = Depends(verify_api_key)):
     """Analyze code, attempt to fix issues, and return the fixed code."""
     if request.language == CodeLanguage.PYTHON:
         result = await fix_python_code(request.code, request.filename)
@@ -362,7 +365,7 @@ async def fix_code(request: CodeAnalysisRequest, db: DatabaseManager = Depends(g
         return CodeFixResult(fixed_code=request.code, issues_remaining=[], applied_fixes=[])
 
 @app.post("/snippets", response_model=CodeSnippet)
-async def store_snippet(request: StoreSnippetRequest, db: DatabaseManager = Depends(get_db_manager)):
+async def store_snippet(request: StoreSnippetRequest, db: DatabaseManager = Depends(get_db_manager), api_key: str = Depends(verify_api_key)):
     """Store a code snippet and return its ID."""
     snippet_id = str(uuid.uuid4())
     snippet = CodeSnippet(
@@ -387,7 +390,7 @@ async def store_snippet(request: StoreSnippetRequest, db: DatabaseManager = Depe
         raise HTTPException(status_code=500, detail=f"Error storing snippet: {str(e)}")
 
 @app.get("/snippets/{snippet_id}", response_model=CodeSnippet)
-async def get_snippet(snippet_id: str, db: DatabaseManager = Depends(get_db_manager)):
+async def get_snippet(snippet_id: str, db: DatabaseManager = Depends(get_db_manager), api_key: str = Depends(verify_api_key)):
     """Retrieve a stored code snippet by ID."""
     try:
         snippet = await db.get_code_snippet(snippet_id)
@@ -405,7 +408,7 @@ async def get_snippet(snippet_id: str, db: DatabaseManager = Depends(get_db_mana
         raise HTTPException(status_code=500, detail=f"Internal server error retrieving snippet: {str(e)}")
 
 @app.get("/snippets")
-async def list_snippets(db: DatabaseManager = Depends(get_db_manager)):
+async def list_snippets(db: DatabaseManager = Depends(get_db_manager), api_key: str = Depends(verify_api_key)):
     """List all stored code snippet IDs."""
     try:
         snippets = await db.list_code_snippets()

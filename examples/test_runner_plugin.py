@@ -9,6 +9,7 @@ import sys
 import json
 import requests
 from typing import Dict, Any, List, Optional
+import logging
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -19,9 +20,30 @@ except ImportError:
     print("Error: Could not import from agents.agent. Make sure you're running from the project root.")
     sys.exit(1)
 
-# Default settings
-MCP_TEST_SERVER_URL = os.environ.get("MCP_TEST_SERVER_URL", "http://localhost:8082")
+# Base URL for the MCP Test Server
+try:
+    MCP_TEST_SERVER_URL = os.environ.get("MCP_TEST_SERVER_URL", "http://localhost:8082")
+    # API Key for authentication
+    API_KEY = os.environ.get("AGENT_API_KEY")
+    if not API_KEY:
+        print("Warning: AGENT_API_KEY environment variable not set for MCP communication.", file=sys.stderr)
+        API_KEY = None
+except Exception as e:
+    print(f"Error loading MCP configuration: {e}", file=sys.stderr)
+    MCP_TEST_SERVER_URL = "http://localhost:8082" # Default fallback
+    API_KEY = None
 
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Helper to get headers
+def _get_headers() -> Dict[str, str]:
+    """Returns headers for MCP requests, including API key if available."""
+    headers = {"Content-Type": "application/json"}
+    if API_KEY:
+        headers["X-API-Key"] = API_KEY
+    return headers
 
 def run_tests_with_mcp(
     project_path: str,
@@ -57,7 +79,7 @@ def run_tests_with_mcp(
     }
     
     try:
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=_get_headers())
         response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
         return response.json()
     except requests.exceptions.HTTPError as http_err:
@@ -98,7 +120,7 @@ def get_last_failed_tests_with_mcp() -> Dict[str, Any]:
     url = f"{MCP_TEST_SERVER_URL}/last-failed?project_path={project_path}" 
     
     try:
-        response = requests.get(url)
+        response = requests.get(url, headers=_get_headers())
         response.raise_for_status()
         return {
             "success": True,
@@ -131,7 +153,7 @@ def get_test_result_with_mcp(result_id: str) -> Dict[str, Any]:
     url = f"{MCP_TEST_SERVER_URL}/results/{result_id}"
     
     try:
-        response = requests.get(url)
+        response = requests.get(url, headers=_get_headers())
         response.raise_for_status()
         # Assuming success returns the JSON directly
         return response.json() 
@@ -231,7 +253,7 @@ def apply_fix_and_retest(code: str, file_path: str, project_path: str) -> Dict[s
         # Run the failing tests
         result = run_tests_with_mcp(
             project_path=project_path,
-            test_path="",  # We'll specify individual tests
+            test_path=" ".join(failed_tests),  # Pass specific failed tests
             runner="pytest",
             max_failures=None,  # Run all tests
             run_last_failed=True,  # Run only the previously failing tests
