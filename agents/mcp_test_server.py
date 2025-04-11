@@ -680,7 +680,7 @@ async def run_tests_docker(config: TestExecutionConfig, db: DatabaseManager) -> 
 
 
 @app.get("/")
-async def root():
+async def root(api_key: str = Depends(verify_api_key)):
     """Root endpoint"""
     return {"status": "active", "service": "MCP Test Server"}
 

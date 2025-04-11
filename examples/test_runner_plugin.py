@@ -42,8 +42,9 @@ logger = logging.getLogger(__name__)
 def _get_headers() -> Dict[str, str]:
     """Returns headers for MCP requests, including API key if available."""
     headers = {"Content-Type": "application/json"}
-    if API_KEY:
-        headers["X-API-Key"] = API_KEY
+    api_key = os.environ.get("AGENT_API_KEY") # Read env var at call time
+    if api_key:
+        headers["X-API-Key"] = api_key
     return headers
 
 def run_tests_with_mcp(

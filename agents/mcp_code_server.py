@@ -108,6 +108,9 @@ class StoreSnippetRequest(BaseModel):
     language: CodeLanguage = CodeLanguage.PYTHON
     metadata: Dict[str, Any] = {}
 
+class CodeFormatResult(BaseModel):
+    formatted_code: str
+
 async def analyze_python_code(code: str, filename: Optional[str] = None) -> CodeAnalysisResult:
     """Analyze Python code using Ruff for issues and formatting."""
     import tempfile
@@ -300,7 +303,7 @@ async def analyze_code(request: CodeAnalysisRequest, db: DatabaseManager = Depen
         # In the future, we can add support for other languages
         return CodeAnalysisResult(issues=[], formatted_code=request.code)
 
-@app.post("/format", response_model=CodeAnalysisResult)
+@app.post("/format", response_model=CodeFormatResult)
 async def format_code(request: CodeFormatRequest, db: DatabaseManager = Depends(get_db_manager), api_key: str = Depends(verify_api_key)):
     """Format code and return the formatted version."""
     if request.language == CodeLanguage.PYTHON:

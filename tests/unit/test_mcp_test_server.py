@@ -302,7 +302,7 @@ def override_get_db_manager(mock_db_manager):
 # Tests for endpoints
 
 @pytest.mark.asyncio
-async def test_get_result_endpoint(client: AsyncClient, mock_db_manager):
+async def test_get_result_endpoint(client: AsyncClient, mock_db_manager, override_verify_api_key_dependency):
     """Test GET /results/{result_id} endpoint."""
     # Configure the mock DB manager for this specific test
     test_id = "test-id-789"
@@ -334,7 +334,7 @@ async def test_get_result_endpoint(client: AsyncClient, mock_db_manager):
     assert response_data["status"] == "success"
 
 @pytest.mark.asyncio
-async def test_get_result_endpoint_not_found(client, mock_db_manager):
+async def test_get_result_endpoint_not_found(client, mock_db_manager, override_verify_api_key_dependency):
     """Test GET /results/{result_id} when result not found."""
     test_id = "non-existent-id"
     mock_db_manager.get_test_result.return_value = None # Simulate not found
@@ -347,7 +347,7 @@ async def test_get_result_endpoint_not_found(client, mock_db_manager):
     assert "not found" in response.json()["detail"].lower()
 
 @pytest.mark.asyncio
-async def test_list_results_endpoint(client, mock_db_manager):
+async def test_list_results_endpoint(client, mock_db_manager, override_verify_api_key_dependency):
     """Test GET /results endpoint."""
     # Configure mock DB to return list of dicts, matching db function
     mock_results_from_db = [
@@ -365,7 +365,7 @@ async def test_list_results_endpoint(client, mock_db_manager):
 
 
 @pytest.mark.asyncio
-async def test_last_failed_endpoint(client, mock_db_manager):
+async def test_last_failed_endpoint(client, mock_db_manager, override_verify_api_key_dependency):
     """Test GET /last-failed endpoint."""
     # Configure mock DB
     mock_failed = ["test_a.py::test_fail1", "test_b.py::test_fail2"]
@@ -381,13 +381,13 @@ async def test_last_failed_endpoint(client, mock_db_manager):
     assert response.json() == mock_failed
 
 @pytest.mark.asyncio
-async def test_last_failed_endpoint_missing_param(client):
+async def test_last_failed_endpoint_missing_param(client, override_verify_api_key_dependency):
     """Test GET /last-failed endpoint without required parameter."""
     response = await client.get("/last-failed")
     assert response.status_code == 422 # Unprocessable Entity
 
 
-def test_run_tests_local_success(sample_project_path):
+def test_run_tests_local_success_sync(sample_project_path, client_sync, override_verify_api_key_dependency):
     """Test running tests locally that should succeed."""
     config = {
         "project_path": str(sample_project_path),
@@ -399,7 +399,7 @@ def test_run_tests_local_success(sample_project_path):
     assert response.status_code == 200
 
 
-def test_run_tests_local_failure(sample_project_path):
+def test_run_tests_local_failure_sync(sample_project_path, client_sync, override_verify_api_key_dependency):
     """Test running tests locally that should fail."""
     config = {
         "project_path": str(sample_project_path),
@@ -412,7 +412,7 @@ def test_run_tests_local_failure(sample_project_path):
 
 
 @pytest.mark.skipif(not shutil.which("docker"), reason="Docker not found in PATH")
-def test_run_tests_docker_success(sample_project_path):
+def test_run_tests_docker_success_sync(sample_project_path, client_sync, override_verify_api_key_dependency):
     """Test running tests in Docker that should succeed."""
     config = {
         "project_path": str(sample_project_path),
@@ -426,7 +426,7 @@ def test_run_tests_docker_success(sample_project_path):
 
 
 @pytest.mark.skipif(not shutil.which("docker"), reason="Docker not found in PATH")
-def test_run_tests_docker_failure(sample_project_path):
+def test_run_tests_docker_failure_sync(sample_project_path, client_sync, override_verify_api_key_dependency):
     """Test running tests in Docker that should fail."""
     config = {
         "project_path": str(sample_project_path),
@@ -439,7 +439,7 @@ def test_run_tests_docker_failure(sample_project_path):
     assert response.status_code == 200 
 
 
-def test_run_tests_invalid_path():
+def test_run_tests_invalid_path_sync(client_sync, override_verify_api_key_dependency):
     """Test running tests with an invalid project path."""
     config = {
         "project_path": "/nonexistent/path/that/hopefully/doesnt/exist",
@@ -560,10 +560,15 @@ async def test_list_results_auth(mock_db_manager):
 # Mock filesystem structure fixture
 @pytest.fixture(scope="session")
 def sample_project_path(tmp_path_factory):
-    # ... (fixture implementation)
+    base_path = tmp_path_factory.mktemp("sample_project_session")
+    # Create dummy test files
+    (base_path / "test_passing.py").write_text("def test_passes(): assert True")
+    (base_path / "test_failing.py").write_text("def test_fails(): assert False")
+    (base_path / "__init__.py").touch() # Ensure it's treated as a package if needed
+    return base_path
 
 # Override verify_api_key dependency for most tests
-@pytest.fixture(autouse=True)
+@pytest.fixture()
 def override_verify_api_key_dependency(monkeypatch):
     """Override the verify_api_key dependency for most tests."""
     async def _override_verify():
@@ -617,7 +622,7 @@ class TestMCPTestServer(unittest.TestCase):
 # --- Streaming Test ---
 
 @pytest.mark.asyncio
-async def test_run_tests_streaming_local(client_async, mock_db_manager, sample_project_path):
+async def test_run_tests_streaming_local(client_async, mock_db_manager, sample_project_path, override_verify_api_key_dependency):
     """Test the /run-tests endpoint with local mode for streaming response."""
     config = {
         "project_path": str(sample_project_path),

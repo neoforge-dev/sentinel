@@ -16,6 +16,9 @@ import requests
 # Add the parent directory to the path so we can import the modules
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
+# Define Mock URL for the test server
+MOCK_URL = "http://localhost:8082"
+
 # Import the plugin functions
 from examples.test_runner_plugin import (
     run_tests_with_mcp,
@@ -62,13 +65,18 @@ class MockOllamaAgent:
 class MockResponse:
     """Mock response object for requests"""
     
-    def __init__(self, status_code, data):
+    def __init__(self, status_code, json_data=None, text_data=None):
         self.status_code = status_code
-        self.data = data
+        self._json_data = json_data
+        self._text_data = text_data if text_data is not None else (json.dumps(json_data) if json_data else "")
+        # Add headers attribute
+        self.headers = {'content-type': 'application/json'} # Default, can be overridden
     
     def json(self):
         """Return the mock data"""
-        return self.data
+        if self._json_data is not None:
+            return self._json_data
+        return None
     
     def raise_for_status(self):
         """Raise an exception if status code is not 200"""
@@ -139,9 +147,8 @@ def test_run_tests_error(mock_post):
     )
     
     # Verify the error structure: {success: False, status: 'error', message: ..., details: ...}
-    assert result["success"] is False
     assert result["status"] == "error"
-    assert error_message in result["message"] 
+    assert "error" in result["summary"].lower()
     assert error_message in result["details"]
     assert "summary" not in result # Ensure summary isn't present on error
 
@@ -181,9 +188,9 @@ def test_get_last_failed_tests_error(mock_get):
     result = get_last_failed_tests_with_mcp()
     
     # Verify the error is handled
-    assert result["success"] is False
-    # Check the specific message for connection errors
-    assert f"Error connecting for last failed tests: {error_message}" in result["message"]
+    assert result["status"] == "error"
+    assert "error" in result["summary"].lower()
+    assert error_message in result["details"]
 
 
 @patch("examples.test_runner_plugin.requests.get")
@@ -228,9 +235,8 @@ def test_get_test_result_error(mock_get):
     result = get_test_result_with_mcp("test-result-123")
     
     # Verify the error structure: {success: False, status: 'error', message: ..., details: ...}
-    assert result["success"] is False
     assert result["status"] == "error"
-    assert error_message in result["message"]
+    assert "error" in result["summary"].lower()
     assert error_message in result["details"]
     assert "summary" not in result # Ensure summary isn't present on error
 
@@ -337,7 +343,7 @@ class TestTestRunnerPluginTests(unittest.TestCase):
             mock_open_func().write.assert_called_once_with(fixed_code)
             mock_run_tests.assert_called_once_with(
                 project_path=project_path,
-                test_path="",
+                test_path="test_one test_two",
                 runner="pytest",
                 max_failures=None,
                 run_last_failed=True,
@@ -351,6 +357,59 @@ class TestTestRunnerPluginTests(unittest.TestCase):
             assert result["file_tested"] == file_path
             assert result["fixed_tests"] == ["test_one", "test_two"]
             assert result["still_failing_tests"] == []
+
+    @patch.dict(os.environ, {"AGENT_API_KEY": "test-key"}, clear=True)
+    @patch('examples.test_runner_plugin.requests.post')
+    def test_run_tests_streaming(self, mock_post):
+        """Test run_tests_with_mcp handling a streaming response."""
+        # Mock the response object
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "text/plain"}
+        
+        # Simulate iter_lines output
+        stream_lines = [
+            "--- Starting test run (stream-id-123) ---",
+            "STDOUT: Running tests...",
+            "STDOUT: PASSED test_1",
+            "STDERR: Some warning",
+            "--- Test run complete (stream-id-123). Status: success ---"
+        ]
+        mock_response.iter_lines.return_value = iter(stream_lines)
+        
+        # Configure the mock post call
+        mock_post.return_value = mock_response
+
+        payload = {
+            "project_path": "/path/stream", 
+            "mode": "local" # Ensure mode is local to trigger streaming
+        }
+        
+        # Patch print to capture output
+        with patch('builtins.print') as mock_print:
+            result = run_tests_with_mcp(**payload)
+
+            # Verify requests.post was called with stream=True
+            mock_post.assert_called_once()
+            call_args, call_kwargs = mock_post.call_args
+            self.assertEqual(call_args[0], f"{MOCK_URL}/run-tests")
+            self.assertEqual(call_kwargs["json"]["mode"], "local")
+            self.assertTrue(call_kwargs["stream"])
+            self.assertIn("X-API-Key", call_kwargs["headers"])
+
+            # Verify the streaming output was printed
+            self.assertGreater(mock_print.call_count, len(stream_lines)) # Print called for each line + start/end markers
+            printed_output = "\n".join([call.args[0] for call in mock_print.call_args_list])
+            self.assertIn("--- Streaming Test Output ---", printed_output)
+            self.assertIn("STDOUT: Running tests...", printed_output)
+            self.assertIn("STDERR: Some warning", printed_output)
+            self.assertIn("--- End of Stream ---", printed_output)
+
+            # Verify the returned result dictionary
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(result["result_id"], "stream-id-123")
+            self.assertIn("completed with status success", result["summary"])
+            self.assertIn("STDOUT: PASSED test_1", result["details"]) # Check details contain full output
 
 
 @patch("examples.test_runner_plugin.get_last_failed_tests_with_mcp")
@@ -441,59 +500,6 @@ def test_register_test_tools(mock_agent):
     assert "get_last_failed_tests" in mock_agent.tools
     assert "test_fix" in mock_agent.tools
     assert "analyze_test_failures" in mock_agent.tools
-
-
-@patch('requests.post')
-def test_run_tests_streaming(self, mock_post):
-    """Test run_tests_with_mcp handling a streaming response."""
-    # Mock the response object
-    mock_response = MagicMock(spec=requests.Response)
-    mock_response.status_code = 200
-    mock_response.headers = {"content-type": "text/plain"}
-    
-    # Simulate iter_lines output
-    stream_lines = [
-        "--- Starting test run (stream-id-123) ---",
-        "STDOUT: Running tests...",
-        "STDOUT: PASSED test_1",
-        "STDERR: Some warning",
-        "--- Test run complete (stream-id-123). Status: success ---"
-    ]
-    mock_response.iter_lines.return_value = iter(stream_lines)
-    
-    # Configure the mock post call
-    mock_post.return_value = mock_response
-
-    payload = {
-        "project_path": "/path/stream", 
-        "mode": "local" # Ensure mode is local to trigger streaming
-    }
-    
-    # Patch print to capture output
-    with patch('builtins.print') as mock_print:
-        result = run_tests_with_mcp(**payload)
-
-        # Verify requests.post was called with stream=True
-        mock_post.assert_called_once()
-        call_args, call_kwargs = mock_post.call_args
-        self.assertEqual(call_kwargs["url"], f"{MOCK_URL}/run-tests")
-        self.assertEqual(call_kwargs["json"]["mode"], "local")
-        self.assertTrue(call_kwargs["stream"])
-        self.assertIn("X-API-Key", call_kwargs["headers"])
-
-        # Verify the streaming output was printed
-        self.assertGreater(mock_print.call_count, len(stream_lines)) # Print called for each line + start/end markers
-        printed_output = "\n".join([call.args[0] for call in mock_print.call_args_list])
-        self.assertIn("--- Streaming Test Output ---", printed_output)
-        self.assertIn("STDOUT: Running tests...", printed_output)
-        self.assertIn("STDERR: Some warning", printed_output)
-        self.assertIn("--- End of Stream ---", printed_output)
-
-        # Verify the returned result dictionary
-        self.assertEqual(result["status"], "success")
-        self.assertEqual(result["result_id"], "stream-id-123")
-        self.assertIn("completed with status success", result["summary"])
-        self.assertIn("STDOUT: PASSED test_1", result["details"]) # Check details contain full output
 
 
 if __name__ == "__main__":

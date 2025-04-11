@@ -71,7 +71,7 @@ def override_get_db_manager(mock_db_manager):
     app.dependency_overrides = original_overrides
 
 # Override verify_api_key dependency (optional, can test actual dependency too)
-@pytest.fixture(autouse=True)
+@pytest.fixture()
 def override_verify_api_key_dependency():
     """Override the verify_api_key dependency for most tests."""
     async def _override_verify():
@@ -86,20 +86,20 @@ def override_verify_api_key_dependency():
     # Restore original overrides
     app.dependency_overrides = original_overrides
 
-def test_root_endpoint():
+def test_root_endpoint(client_sync, override_verify_api_key_dependency):
     """Test the root endpoint returns a 200 status code"""
-    response = client.get("/")
+    response = client_sync.get("/")
     assert response.status_code == 200
     assert "MCP Code Server" in response.text
 
 
-def test_analyze_code_valid():
+def test_analyze_code_valid(client_sync, override_verify_api_key_dependency):
     """Test analyzing valid Python code"""
     test_code = """
 def add(a, b):
     return a + b
 """
-    response = client.post("/analyze", json={"code": test_code})
+    response = client_sync.post("/analyze", json={"code": test_code})
     assert response.status_code == 200
     result = response.json()
     
@@ -115,7 +115,7 @@ def add(a, b):
     assert "def add(a, b):" in result["formatted_code"]
 
 
-def test_analyze_code_with_issues():
+def test_analyze_code_with_issues(client_sync, override_verify_api_key_dependency):
     """Test analyzing Python code with issues"""
     # This code has unused import and undefined variable issues
     test_code = """
@@ -126,7 +126,7 @@ import json
 def print_value():
     print(undefined_var)
 """
-    response = client.post("/analyze", json={"code": test_code})
+    response = client_sync.post("/analyze", json={"code": test_code})
     assert response.status_code == 200
     result = response.json()
     
@@ -139,21 +139,21 @@ def print_value():
     assert "F821" in issue_codes  # Undefined name
 
 
-def test_analyze_code_invalid_request():
+def test_analyze_code_invalid_request(client_sync, override_verify_api_key_dependency):
     """Test analyzing code with an invalid request body"""
     # Missing required 'code' field
-    response = client.post("/analyze", json={})
+    response = client_sync.post("/analyze", json={})
     assert response.status_code == 422  # Unprocessable Entity for validation errors
 
 
-def test_format_code_valid():
+def test_format_code_valid(client_sync, override_verify_api_key_dependency):
     """Test formatting valid Python code"""
     # Code with formatting issues
     test_code = """
 def add(a,b):
     return a+b
 """
-    response = client.post("/format", json={"code": test_code})
+    response = client_sync.post("/format", json={"code": test_code})
     assert response.status_code == 200
     result = response.json()
     
@@ -162,14 +162,14 @@ def add(a,b):
     assert "def add(a, b):" in result["formatted_code"]  # Space after comma
 
 
-def test_format_code_invalid():
+def test_format_code_invalid(client_sync, override_verify_api_key_dependency):
     """Test formatting invalid Python code which should return an error."""
     # Invalid syntax
     test_code = """
 def add(a,b)
     return a+b
 """
-    response = client.post("/format", json={"code": test_code})
+    response = client_sync.post("/format", json={"code": test_code})
     # Expect a 400 Bad Request because syntax prevents formatting
     assert response.status_code == 400
     result = response.json()
@@ -184,7 +184,7 @@ def add(a,b)
 
 
 @pytest.mark.asyncio
-async def test_store_and_get_snippet(client_async, mock_db_manager):
+async def test_store_and_get_snippet(client_async, mock_db_manager, override_verify_api_key_dependency):
     """Test storing and retrieving a code snippet."""
     # Define snippet data without ID first
     snippet_data = {"code": "print('Hello')", "language": "python"}
@@ -256,7 +256,7 @@ async def test_get_snippet_not_found(client_async, mock_db_manager):
 
 # Optional: Add tests for DB errors
 @pytest.mark.asyncio
-async def test_store_snippet_db_error(client_async, mock_db_manager):
+async def test_store_snippet_db_error(client_async, mock_db_manager, override_verify_api_key_dependency):
     """Test storing snippet when DB fails."""
     snippet_data = {"code": "fail me", "language": "python"}
 
@@ -270,7 +270,7 @@ async def test_store_snippet_db_error(client_async, mock_db_manager):
 
 
 @pytest.mark.asyncio
-async def test_get_snippet_db_error(client_async, mock_db_manager):
+async def test_get_snippet_db_error(client_async, mock_db_manager, override_verify_api_key_dependency):
     """Test retrieving snippet when DB fails."""
     snippet_id = "error-snippet-get"
 
@@ -284,7 +284,7 @@ async def test_get_snippet_db_error(client_async, mock_db_manager):
 
 
 @pytest.mark.asyncio
-async def test_get_all_snippets(client_async, mock_db_manager):
+async def test_get_all_snippets(client_async, mock_db_manager, override_verify_api_key_dependency):
     """Test retrieving all stored snippets"""
     # Configure mock DB to return a list of snippet IDs (or full snippets)
     mock_snippet_list = [

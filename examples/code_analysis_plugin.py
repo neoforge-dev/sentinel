@@ -35,18 +35,23 @@ except Exception as e:
     MCP_CODE_SERVER_URL = "http://localhost:8000" # Default fallback
     API_KEY = None
 
+# Set up logging for the plugin
+logger = logging.getLogger(__name__)
+
 def _get_headers() -> Dict[str, str]:
     """Returns headers for MCP requests, including API key if available."""
     headers = {"Content-Type": "application/json"}
-    if API_KEY:
-        headers["X-API-Key"] = API_KEY
+    api_key = os.environ.get("AGENT_API_KEY") # Read env var at call time
+    if api_key:
+        headers["X-API-Key"] = api_key
     return headers
 
 def analyze_code_with_mcp(code: str, language: str = "python") -> Dict[str, Any]:
     """
     Analyze code using the MCP Code Server
     """
-    url = f"{MCP_CODE_SERVER_URL}/analyze"
+    mcp_url = os.environ.get("MCP_CODE_SERVER_URL", "http://localhost:8000") # Read env var inside
+    url = f"{mcp_url}/analyze"
     
     payload = {
         "code": code,

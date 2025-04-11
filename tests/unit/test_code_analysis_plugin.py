@@ -8,13 +8,14 @@ import os
 import json
 import pytest
 import requests # Import requests for exception testing
-from unittest.mock import patch, MagicMock, ANY
+from unittest.mock import patch, MagicMock, ANY, AsyncMock, call, mock_open
 import uuid # Import uuid for patching
 
 # Add the parent directory to the path so we can import the modules
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 # Import the plugin functions
+from examples import code_analysis_plugin
 from examples.code_analysis_plugin import (
     analyze_code_with_mcp,
     format_code_with_mcp,
@@ -65,6 +66,10 @@ MOCK_URL = "http://mock-mcp-code-server:8081" # Ensure port matches plugin defau
 MOCK_API_KEY = "test-agent-key"
 
 # Mock the requests library
+@patch.dict(os.environ, {
+    "MCP_CODE_SERVER_URL": MOCK_URL, 
+    "AGENT_API_KEY": MOCK_API_KEY
+}, clear=True)
 @patch('requests.post')
 def test_analyze_code_success(mock_post):
     """Test analyze_code_with_mcp successful call."""
@@ -77,9 +82,9 @@ def test_analyze_code_success(mock_post):
     result = analyze_code_with_mcp("print('hello')")
     
     mock_post.assert_called_once_with(
-        url=f"{MOCK_URL}/analyze", 
+        f"{MOCK_URL}/analyze",
         json={"code": "print('hello')", "language": "python", "filename": None},
-        headers=expected_headers # Verify headers
+        headers=expected_headers
     )
     assert result["success"] == True
 
@@ -88,15 +93,16 @@ def test_analyze_code_success(mock_post):
 @patch.dict(os.environ, {"AGENT_API_KEY": ""}) # Test without API key
 def test_analyze_code_no_api_key(mock_post):
     """Test analyze_code_with_mcp without API key header."""
+    # Reload the plugin module to reflect the patched environment variable
+    import importlib
+    # Ensure code_analysis_plugin is the actual module object
+    importlib.reload(code_analysis_plugin)
+
     expected_headers = {"Content-Type": "application/json"} # No X-API-Key
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = {"success": True, "issues": []}
     mock_post.return_value = mock_response
-    
-    # Call the function (need to reload the module or patch the global API_KEY)
-    import importlib
-    importlib.reload(code_analysis_plugin)
     
     result = analyze_code_with_mcp("test code")
     
