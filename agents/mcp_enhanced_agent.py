@@ -139,6 +139,7 @@ class MCPEnhancedAgent(OllamaAgent):
             raise RuntimeError("Test tools not registered. Make sure the test MCP server is running.")
         
         # Execute the tool
+        print(f"Initiating test run (Runner: {runner}, Mode: {mode})...")
         result = self.execute_tool("run_tests", {
             "project_path": project_path,
             "test_path": test_path,
@@ -147,7 +148,28 @@ class MCPEnhancedAgent(OllamaAgent):
             **kwargs
         })
         
-        return result
+        # Handle potential streaming output
+        if isinstance(result, dict) and "details" in result and "summary" in result and "status" in result:
+            # Check if details look like streamed output already printed by plugin
+            # (The plugin currently prints and returns the full log in 'details')
+            if "--- Streaming Test Output ---" in result["details"]:
+                print(f"\nTest run finished. Status: {result.get('status', 'unknown')}")
+                print(f"Summary: {result.get('summary', 'N/A')}")
+                # Optionally, still return the full result dict
+                return result 
+            else:
+                # If not streamed (e.g., Docker run), print summary and details
+                print(f"\nTest run finished. Status: {result.get('status', 'unknown')}")
+                print(f"Summary: {result.get('summary', 'N/A')}")
+                print("--- Details ---")
+                print(result["details"])
+                print("---------------")
+                return result
+        else:
+             # Fallback for unexpected result format
+            print("Received unexpected result format from test runner:")
+            print(result)
+            return {"status": "error", "summary": "Unexpected result format", "details": str(result)}
     
     def analyze_code(
         self,

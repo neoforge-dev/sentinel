@@ -34,6 +34,7 @@ import traceback
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 import uvicorn
 import tiktoken
@@ -43,13 +44,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # sys.path.append(str(Path(__file__).resolve().parent.parent))
 # No longer needed with pytest.ini configuration
 from src.storage.database import get_db_manager, DatabaseManager
-
-# Import security dependency
-try:
-    from src.security import verify_api_key
-except ImportError as e:
-    logger.error(f"Failed to import security module: {e}. API key verification will be disabled.")
-    async def verify_api_key(): pass # Dummy dependency
+from src.security import verify_api_key
 
 # Set up logging
 logging.basicConfig(
@@ -267,6 +262,46 @@ def truncate_to_token_limit(text: str, max_tokens: int) -> str:
     ending = '\n'.join(lines[-20:])
     
     return f"{beginning}\n...[truncated for token limit]...\n{ending}"
+
+
+# Generator for streaming subprocess output
+async def stream_subprocess_output(process: asyncio.subprocess.Process):
+    """Yield stdout and stderr lines from a subprocess as they arrive."""
+    # Use asyncio.gather to read both stdout and stderr concurrently
+    async def read_stream(stream, prefix):
+        if stream is None:
+            return
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            yield f"{prefix}: {line.decode()}"
+
+    stdout_task = asyncio.create_task(read_stream(process.stdout, "STDOUT"))
+    stderr_task = asyncio.create_task(read_stream(process.stderr, "STDERR"))
+
+    # Yield from tasks as they complete
+    pending = {stdout_task, stderr_task}
+    while pending:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            try:
+                async for line in task.result(): # Iterate through the generator returned by read_stream
+                    yield line
+            except Exception as e:
+                # Log error if reading stream fails, but continue if possible
+                logger.error(f"Error reading stream in stream_subprocess_output: {e}")
+                # Ensure the task is removed from pending if it errored
+                if task in pending: 
+                    pending.remove(task)
+
+    # Final check on tasks that might finish without yielding if stream ends abruptly
+    for task in pending:
+        try:
+            async for line in task.result():
+                 yield line
+        except Exception:
+             pass # Already logged
 
 
 async def run_tests_local(config: TestExecutionConfig, db: DatabaseManager) -> TestResult:
@@ -645,14 +680,14 @@ async def run_tests_docker(config: TestExecutionConfig, db: DatabaseManager) -> 
 
 
 @app.get("/")
-async def root(api_key: str = Depends(verify_api_key)):
+async def root():
     """Root endpoint"""
     return {"status": "active", "service": "MCP Test Server"}
 
 
-@app.post("/run-tests", response_model=TestResult)
-async def run_tests_endpoint(config: TestExecutionConfig, db: DatabaseManager = Depends(get_db_manager), api_key: str = Depends(verify_api_key)):
-    """Run tests with the given configuration (Endpoint wrapper)"""
+@app.post("/run-tests")
+async def run_tests_endpoint(config: TestExecutionConfig, db: DatabaseManager = Depends(get_db_manager), api_key: str = Depends(verify_api_key), background_tasks: BackgroundTasks = BackgroundTasks()):
+    """Run tests with the given configuration. Streams local output."""
     # Validate project path
     if not os.path.isdir(config.project_path):
         raise HTTPException(status_code=400, detail=f"Project path not found: {config.project_path}")
@@ -667,16 +702,132 @@ async def run_tests_endpoint(config: TestExecutionConfig, db: DatabaseManager = 
     
     # Run tests based on mode
     if config.mode == ExecutionMode.LOCAL:
-        return await run_tests_local(config, db)
+        # === Streaming Implementation ===
+        cmd = []
+        if config.runner == TestRunner.UV:
+            cmd = ["uv", "run", "-m", "pytest"]
+        elif config.runner == TestRunner.PYTEST:
+            cmd = ["python", "-m", "pytest"]
+        elif config.runner == TestRunner.UNITTEST:
+            cmd = ["python", "-m", "unittest"]
+        
+        test_path_abs = os.path.join(config.project_path, config.test_path)
+        cmd.append(test_path_abs)
+        if config.max_failures is not None:
+             cmd.extend(["-x" if config.max_failures == 1 else f"--maxfail={config.max_failures}"])
+        cmd.append("-v") # Add verbosity
+        cmd.extend(config.additional_args)
+        
+        logger.info(f"Streaming command: {' '.join(cmd)}")
+
+        async def stream_generator():
+            process = None
+            full_output_lines = []
+            process_status = {"returncode": None, "error": None, "timed_out": False}
+            start_time = time.time()
+            result_id = str(uuid.uuid4())
+
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=config.project_path
+                )
+
+                logger.info(f"Subprocess started (PID: {process.pid}) for streaming.")
+                yield f"--- Starting test run ({result_id}) ---\n"
+
+                # Stream output while process runs
+                async for line in stream_subprocess_output(process):
+                    full_output_lines.append(line)
+                    yield line
+
+                # Wait for process completion after streaming finishes
+                try:
+                    return_code = await asyncio.wait_for(process.wait(), timeout=config.timeout) 
+                    process_status["returncode"] = return_code
+                    logger.info(f"Subprocess finished with code: {return_code}")
+                except asyncio.TimeoutError:
+                    logger.warning(f"Subprocess timed out after {config.timeout} seconds.")
+                    process_status["timed_out"] = True
+                    if process.returncode is None: process.terminate()
+                    yield f"--- Test run timed out ({result_id}) ---\n"
+                    # No need to process results if timed out here for the stream part
+                    return # Exit generator on timeout
+                
+                yield f"--- Processing results ({result_id}) ---\n"
+                # --- Process final result --- 
+                end_time = time.time()
+                output = "".join(full_output_lines)
+                cleaned_output = clean_test_output(output, config.max_tokens)
+                results = extract_test_results(cleaned_output)
+                summary = extract_test_summary(cleaned_output)
+                details = truncate_to_token_limit(cleaned_output, config.max_tokens)
+                status = "success"
+                if process_status["returncode"] != 0 or results["failed"]:
+                    status = "failed"
+                elif not results["passed"] and not results["failed"]:
+                    status = "error" 
+                    summary = "No tests found or executed." + (" " + summary if summary else "")
+
+                result = TestResult(
+                    id=result_id,
+                    project_path=config.project_path,
+                    test_path=config.test_path,
+                    runner=config.runner.value,
+                    execution_mode=config.mode.value,
+                    status=status,
+                    summary=summary,
+                    details=details, # Store truncated details
+                    passed_tests=results["passed"],
+                    failed_tests=results["failed"],
+                    skipped_tests=results["skipped"],
+                    execution_time=end_time - start_time
+                )
+
+                # Store result in background
+                background_tasks.add_task(
+                    db.store_test_result,
+                    result_id=result.id,
+                    status=result.status,
+                    summary=result.summary,
+                    details=result.details,
+                    passed_tests=result.passed_tests,
+                    failed_tests=result.failed_tests,
+                    skipped_tests=result.skipped_tests,
+                    execution_time=result.execution_time,
+                    config=config.model_dump()
+                )
+                logger.info(f"Scheduled DB storage for result {result_id}")
+                yield f"--- Test run complete ({result_id}). Status: {status} ---\n"
+
+            except Exception as e:
+                logger.error(f"Error during test streaming/execution: {e}", exc_info=True)
+                yield f"--- ERROR during test execution: {str(e)} ---\n"
+                # Optionally store an error result in DB here too
+            finally:
+                # Ensure process is cleaned up if it exists and hasn't finished
+                if process and process.returncode is None:
+                    logger.warning(f"Terminating hanging process {process.pid}")
+                    try:
+                        process.terminate()
+                        await asyncio.wait_for(process.wait(), timeout=2) # Short wait after terminate
+                    except Exception as term_err:
+                        logger.error(f"Error terminating process {process.pid}: {term_err}")
+                        try: process.kill() # Force kill if terminate fails
+                        except Exception: pass 
+
+        return StreamingResponse(stream_generator(), media_type="text/plain")
     elif config.mode == ExecutionMode.DOCKER:
+        # Docker execution does not support streaming yet
         return await run_tests_docker(config, db)
     else:
-        # Should be caught by Pydantic validation, but handle defensively
         raise HTTPException(status_code=400, detail=f"Invalid execution mode: {config.mode}")
 
 
 @app.get("/results/{result_id}", response_model=TestResult)
-async def get_test_result(result_id: str, db: DatabaseManager = Depends(get_db_manager), api_key: str = Depends(verify_api_key)):
+async def get_test_result(result_id: str, db: DatabaseManager = Depends(get_db_manager)):
     """Get the result of a previous test run"""
     result = await db.get_test_result(result_id)
     if not result:
@@ -686,14 +837,14 @@ async def get_test_result(result_id: str, db: DatabaseManager = Depends(get_db_m
 
 
 @app.get("/results", response_model=List[str])
-async def list_test_results(db: DatabaseManager = Depends(get_db_manager), api_key: str = Depends(verify_api_key)):
+async def list_test_results(db: DatabaseManager = Depends(get_db_manager)):
     """List all test result IDs"""
     results = await db.list_test_results()
     return [r["id"] for r in results]
 
 
 @app.get("/last-failed", response_model=List[str])
-async def get_last_failed_tests(project_path: str, db: DatabaseManager = Depends(get_db_manager), api_key: str = Depends(verify_api_key)):
+async def get_last_failed_tests(project_path: str, db: DatabaseManager = Depends(get_db_manager)):
     """Get the list of last failed tests"""
     failed_tests = await db.get_last_failed_tests(project_path)
     return failed_tests

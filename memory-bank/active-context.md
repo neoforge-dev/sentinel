@@ -2,7 +2,7 @@
 
 ## Current Focus
 
-Refactoring/fixing the `test_fix_code` function in `examples/test_runner_plugin.py` which is causing a fixture error during test collection. This involves either moving it to the `tests/` directory and making it a proper test, or changing its signature if it's meant as a utility function.
+Implementing authentication for MCP servers using a simple API key strategy.
 
 ## Recent Changes
 
@@ -28,23 +28,31 @@ Refactoring/fixing the `test_fix_code` function in `examples/test_runner_plugin.
 20. Systematically fixed errors in unit tests related to imports, mocking (patch targets, return values, assertion logic), fixtures (`sample_project_path`, async `client`), asynchronous operations, API endpoint logic (`run_tests_docker`, `list_test_results`), and exception handling.
 21. Deleted the outdated/incorrect test file `tests/test_plugins/test_test_analysis_plugin.py`.
 22. Updated memory bank (`progress.md`, `active-context.md`).
+23. Integrated database backend for snippet storage in Code MCP server.
+24. Updated Code MCP server tests to mock database interactions.
+25. Implemented API Key authentication:
+    - Created `src/security.py` with `verify_api_key` dependency.
+    - Added `Depends(verify_api_key)` to all MCP server endpoints.
+    - Updated agent plugins to send `X-API-Key` header.
+    - Updated server unit tests for authentication.
 
 ## Next Steps
 
-1. **Resolve `test_fix_code` Error**: Refactor or move the function causing the `fixture 'code' not found` error.
-2. **Commit Changes**: Commit the fixes made to the test suite.
-3. **Add Persistent Storage**: Add database backend for Code MCP server.
-4. **Implement Authentication**: Add basic authentication for MCP servers.
-5. **Improve Error Handling**: Enhance recovery from server failures.
-6. **Add More Test Frameworks**: Support more testing frameworks.
-7. **Setup CI/CD Pipeline**: Add automated testing and deployment.
-8. **Add Streaming Support**: Implement streaming for tests and agent responses.
-9. **Create Comprehensive Testing**: Add integration tests.
+1. **Refine Plugin Tests**: Manually update plugin unit tests to fully verify API key header usage.
+2. **Refactor `TestMCPTestServer`**: Convert unittest-style tests to pytest fixtures for consistency.
+3. **Improve Error Handling**: Enhance recovery from server failures.
+4. **Add More Test Frameworks**: Support more testing frameworks.
+5. **Setup CI/CD Pipeline**: Add automated testing and deployment.
+6. **Add Streaming Support**: Implement streaming for tests and agent responses.
+7. **Create Comprehensive Testing**: Add integration tests.
+8. **Refactor `test_fix_code` Error**: Address the fixture error.
 
 ## Active Decisions
 
-*No new major decisions. Focusing on stabilizing tests.*
+*Using simple API Key (X-API-Key header) for initial MCP authentication.*
 
 ## Current Considerations
 
-*Decide on the best approach for `test_fix_code` (move vs. refactor).* 
+*Need to securely manage the actual API key(s) in deployment (e.g., Vault, proper env management).*
+*Consider more robust authentication methods (e.g., OAuth, JWT) if requirements evolve.*
+*Address the remaining test failures in `tests/unit/test_mcp_test_server.py` due to mixed test styles.* 

@@ -10,6 +10,7 @@ import json
 import requests
 from typing import Dict, Any, List, Optional
 import logging
+import re
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -57,16 +58,10 @@ def run_tests_with_mcp(
     docker_image: Optional[str] = None,
     additional_args: Optional[List[str]] = None
 ) -> Dict[str, Any]:
-    """
-    Run tests using the MCP Test Server
-    """
-    url = f"{MCP_TEST_SERVER_URL}/run-tests"
-    
-    if additional_args is None:
-        additional_args = []
-    
+    """Runs tests using the MCP Test Server. Handles streaming for local mode."""
+    endpoint = f"{MCP_TEST_SERVER_URL}/run-tests"
     payload = {
-        "project_path": os.path.abspath(project_path),
+        "project_path": project_path,
         "test_path": test_path,
         "runner": runner,
         "mode": mode,
@@ -77,35 +72,44 @@ def run_tests_with_mcp(
         "docker_image": docker_image,
         "additional_args": additional_args
     }
-    
     try:
-        response = requests.post(url, json=payload, headers=_get_headers())
-        response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
-        return response.json()
-    except requests.exceptions.HTTPError as http_err:
-        # Handle specific HTTP errors (like 4xx, 5xx)
-        return {
-            "success": False,
-            "status": "error",
-            "message": f"HTTP error occurred: {http_err}",
-            "details": response.text if 'response' in locals() else str(http_err)
-        }
-    except requests.exceptions.RequestException as req_err:
-        # Handle other connection errors (DNS failure, refused connection, etc.)
-        return {
-            "success": False, 
-            "status": "error",
-            "message": f"Error connecting to MCP Test Server: {req_err}",
-            "details": str(req_err)
-        }
-    except Exception as e:
-        # Catch any other unexpected errors
-        return {
-            "success": False,
-            "status": "error",
-            "message": f"An unexpected error occurred: {e}",
-            "details": str(e)
-        }
+        # Use stream=True for potential streaming response
+        response = requests.post(endpoint, json=payload, headers=_get_headers(), stream=(mode == 'local')) 
+        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+        
+        if mode == 'local' and response.headers.get("content-type") == "text/plain":
+            # Handle streaming response
+            final_result_summary = {"status": "unknown", "summary": "Processing stream...", "id": "unknown"}
+            print("--- Streaming Test Output --- ")
+            full_output = ""
+            for line in response.iter_lines(decode_unicode=True):
+                if line:
+                    print(line) # Print stream line by line
+                    full_output += line + "\n"
+                    # Attempt to parse final status line (example)
+                    if line.startswith("--- Test run complete"): 
+                        match = re.search(r"\((.*?)\). Status: (\w+)", line)
+                        if match:
+                            final_result_summary["id"] = match.group(1)
+                            final_result_summary["status"] = match.group(2)
+                            final_result_summary["summary"] = f"Run {match.group(1)} completed with status {match.group(2)}."
+            print("--- End of Stream --- ")
+            
+            # Return a summary based on the stream, as the full JSON might not be available
+            # Or potentially fetch the full result using the ID if needed
+            return {
+                "status": final_result_summary["status"],
+                "summary": final_result_summary["summary"],
+                "details": full_output, # Return captured stream as details
+                "result_id": final_result_summary["id"]
+            }
+        else:
+            # Handle non-streaming response (e.g., Docker mode or error)
+            return response.json()
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error running tests via MCP: {e}", exc_info=True)
+        return {"status": "error", "summary": f"MCP request failed: {e}", "details": str(e)}
 
 
 def get_last_failed_tests_with_mcp() -> Dict[str, Any]:

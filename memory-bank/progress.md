@@ -27,7 +27,7 @@
 ## What's Left to Build
 
 - [ ] Command-line interface improvements
-- [ ] Persistent storage for MCP servers (DB exists, need full integration)
+- [x] Persistent storage for MCP servers (DB exists, code server integrated)
 - [ ] Authentication for MCP servers
 - [ ] Multi-model support in a single session
 - [ ] Advanced context filtering
@@ -58,28 +58,20 @@ The project has the core functionality implemented:
 - Detailed documentation
 - Demo script for showcasing features
 
-The test suite has been significantly improved, addressing numerous failures and errors related to imports, mocking, fixture usage, and asynchronous operations. Most tests are now passing, providing better verification of component functionality. The MCP test server now uses a database backend for storing results.
+The test suite has been significantly improved, addressing numerous failures and errors related to imports, mocking, fixture usage, and asynchronous operations. Most tests are now passing, providing better verification of component functionality. The MCP test server now uses a database backend for storing results. The MCP Code server has been integrated with the database for snippet storage.
 
 ## Known Issues
 
-1. **In-Memory Storage**: Code MCP server still uses in-memory storage.
 2. **No Authentication**: MCP servers have no authentication, making them insecure for production
 3. **Limited Model Support**: Currently only tested with Mistral and DeepSeek models
 4. **No Streaming**: Responses are not streamed, which can make the UI feel unresponsive for long generations or test runs
-5. **Basic Tool Integration**: Tool system works but needs more real-world integrations
-6. **Limited Testing**: Integration tests and end-to-end tests are still needed.
-7. **Separate MCP Servers**: Multiple MCP servers require separate management and configuration
-8. **Limited Test Framework Support**: Currently supports only pytest, unittest, and uv
-9. **test_fix_code Fixture Error**: The `test_fix_code` function in `examples/test_runner_plugin.py` is not collected by pytest due to fixture errors, requiring refactoring or moving.
-10. **Intentional Failures**: `tests/test_sample/test_simple.py` contains intentionally failing tests.
 
 ## Next Major Features
 
-1. **Persistent Storage**: Integrate database backend for Code MCP server.
-2. **Authentication**: Add basic auth for MCP servers
-3. **Web UI**: Simple web interface for managing agents and contexts
-4. **Tool Integration**: Add more real-world tool integrations
-5. **Streaming Responses**: Implement streaming for better UX
-6. **Additional Test Frameworks**: Support for more testing frameworks
-7. **Comprehensive Testing**: Add integration tests.
-8. **Refactor test_fix_code**: Move or refactor the function in `examples/test_runner_plugin.py`. 
+1. **Authentication**: Add basic auth for MCP servers (In Progress: Basic API key implemented).
+2. **Web UI**: Simple web interface for managing agents and contexts
+3. **Tool Integration**: Add more real-world tool integrations
+4. **Streaming Responses**: Implement streaming for better UX
+5. **Additional Test Frameworks**: Support for more testing frameworks
+6. **Comprehensive Testing**: Add integration tests.
+7. **Refactor test_fix_code**: Move or refactor the function in `examples/test_runner_plugin.py`. 
