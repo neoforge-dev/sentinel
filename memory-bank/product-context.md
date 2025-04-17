@@ -1,42 +1,45 @@
-# Product Context
+# Product Context Summary
 
-## Problem Statement
+## Problem
+Running context-aware AI agents locally is complex (LLM integration, deps, persistence, tasks).
 
-Many developers want to run AI agents locally for privacy, customization, and reduced costs. However, setting up and integrating local LLMs with context management is complex and requires multiple tools working together.
-
-## Solution
-
-BaseAgent solves this by integrating:
-- **Ollama**: For running local LLMs efficiently
-- **UV**: For Python dependency management
-- **MCP**: For context management across agent sessions
+## Solution: BaseAgent
+Integrates **Ollama**, **UV**, **MCP** (Code/Test servers), and **Communication Layer** for streamlined local agent development with local & Docker testing.
 
 ## Target Users
+- Developers (local/private agents)
+- Researchers (agent architectures)
+- Privacy-focused builders
+- Teams needing isolated test environments
 
-- AI developers who want to run models locally
-- Researchers experimenting with context-aware agents
-- Developers building privacy-focused applications
-- Organizations wanting to keep their data on-premises
+## Key Goals
+- Simple Setup
+- Model Flexibility (Ollama)
+- Specialized Tasks (MCPs)
+- Extensibility (Plugins)
+- Isolated Testing (Docker)
+- Consistent Communication (JSON)
 
-## Key User Experience Goals
+## How It Works (High Level)
+1. **Setup**: Install Ollama, UV; Clone repo; `uv pip install -r requirements.txt`.
+2. **Run**: Start MCP Servers (Code: 8081, Test: 8082); Run Agent/UI.
+3. **Interact**: Agent uses Ollama (generation) & MCPs (analysis, testing via plugins).
+4. **Testing**: MCP Test Server runs tests locally or in Docker.
+5. **Communicate**: Components use standardized JSON schemas.
 
-1. **Simple Setup**: Users should be able to set up and run BaseAgent with minimal steps
-2. **Flexible Integration**: Support different LLMs through Ollama
-3. **Context Persistence**: Maintain context across agent runs through MCP
-4. **Single-File Agents**: Allow creating powerful agents in a single file
+## Core Benefits
+- **Privacy/Cost**: Local LLM execution.
+- **Control**: Over models/agents.
+- **Specialized Tasks**: MCPs handle complex logic.
+- **Simplicity**: UV deps, FastAPI servers.
+- **Isolation**: Docker testing.
+- **Standardization**: Consistent APIs/data.
+- **Flexibility**: Local/Docker testing.
 
-## How It Works
-
-1. **Setup**: User installs Ollama, UV, and sets up BaseAgent
-2. **MCP Server**: Starts the MCP server to manage context
-3. **Agent Creation**: Creates or uses existing agent implementations
-4. **Interaction**: The agent communicates with Ollama for LLM capabilities and MCP for context
-5. **Development**: Users can extend the agent or MCP functionality as needed
-
-## Expected Benefits
-
-- **Privacy**: All processing happens locally
-- **Cost Efficiency**: No API usage fees
-- **Customization**: Full control over agents and models
-- **Context Management**: Persistent context across sessions
-- **Simplicity**: Single-file agents are easy to create and share 
+## Architecture Highlights
+- **MCP Servers**: Code (8081), Test (8082).
+- **Agent Framework**: Core structure.
+- **Communication Layer**: Standardized JSON.
+- **Testing Infrastructure**: Local & Docker support.
+- **Docker Integration**: Isolated environments.
+- **Pydantic Models**: Data validation/schemas.

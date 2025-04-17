@@ -1,42 +1,38 @@
-# Project Brief
+# Project Brief: BaseAgent
 
-## Project: BaseAgent
-
-BaseAgent is an integration of Ollama, UV, and MCP (Model Context Protocol) designed to enable powerful local LLM agents with robust context management.
+## Purpose
+Integrate **Ollama**, **UV**, and **MCP** (Model Context Protocol) to create context-aware local AI agents with a standardized build/test/deploy process.
 
 ## Core Requirements
-
-1. Integrate Ollama for running local LLMs (DeepSeek-R1:32B and Mistral 7B)
-2. Use UV for Python dependency management and support single-file agents
-3. Implement MCP server for context management
-4. Provide a simple API for agents to communicate with LLMs and access context
+- Use Ollama for local LLMs.
+- Use UV for Python dependencies.
+- Implement MCP Code (8081) & Test (8082) servers.
+- Agent interacts with Ollama & MCPs.
+- SQLite DB persistence for MCP servers.
+- Standardized JSON communication layer.
 
 ## Goals
-
-- Enable developers to easily create and run local AI agents
-- Provide context management capabilities via MCP
-- Create a simple but powerful single-file agent architecture
-- Make setup and usage straightforward with good documentation
+- Simplify local AI agent development.
+- Provide extensible context via MCPs.
+- Easy setup & use.
+- Clear architectural boundaries.
+- Support local & Docker test execution.
 
 ## Scope
-
-### In Scope
-
-- Ollama integration for running local LLMs
-- MCP server implementation for context management
-- Single-file agent implementation
-- Basic setup script and documentation
-
-### Out of Scope
-
-- Web UI for agent management
-- Complex agent orchestration
-- Training custom models
-- Cloud deployment options
+- **In**: Ollama, MCP Servers (Code, Test), Agent+Plugins, DB, CI/CD, Basic UI, Docker tests, Integration tests.
+- **Out**: Advanced orchestration, Model training, Complex UI, Prod deployment automation.
 
 ## Success Criteria
+- Agent uses Ollama & MCPs.
+- MCPs perform tasks (analyze, test, store data).
+- CI/CD runs tests & builds images.
+- Basic UI works.
+- Setup via `uv pip install -r requirements.txt`.
+- Tests pass locally & in Docker.
+- Integration tests verify component interaction.
 
-- Agents can successfully communicate with Ollama LLMs
-- MCP server properly stores and serves context
-- Users can easily set up and run the project
-- Agents can access and utilize context from MCP server 
+## Current Status
+- Core functionality operational.
+- MCP servers running on standard ports (8081, 8082).
+- Local & Docker test modes working.
+- Focus: Stabilizing tests, resolving warnings.
