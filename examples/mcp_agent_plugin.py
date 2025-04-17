@@ -11,6 +11,7 @@ import sys
 import asyncio
 import logging
 from typing import Dict, List, Any, Optional, Union
+import requests
 
 # Add the parent directory to the path to import the MCPEnhancedAgent
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -22,10 +23,15 @@ from src.mcp_enhanced_agent import MCPEnhancedAgent
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Configuration
+MCP_CODE_SERVER_URL = os.environ.get("MCP_CODE_SERVER_URL", "http://localhost:8081")
+MCP_TEST_SERVER_URL = os.environ.get("MCP_TEST_SERVER_URL", "http://localhost:8082")
+API_KEY = os.environ.get("MCP_API_KEY", "test-key") # Replace with your actual API key
+
 # Initialize the MCP enhanced agent
 mcp_agent = MCPEnhancedAgent(
-    code_server_url=os.environ.get("MCP_CODE_SERVER_URL", "http://localhost:8000"),
-    test_server_url=os.environ.get("MCP_TEST_SERVER_URL", "http://localhost:8001")
+    code_server_url=MCP_CODE_SERVER_URL,
+    test_server_url=MCP_TEST_SERVER_URL
 )
 
 # Define the agent tool functions

@@ -17,6 +17,7 @@ Dependencies:
 import os
 import sys
 import json
+import subprocess
 import uuid
 import time
 import enum
@@ -35,7 +36,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 # Import Security and Database Components
 try:
-    from src.storage.database import DatabaseManager, get_db_manager
+    from src.storage.database import DatabaseManager, get_request_db_manager, get_db_manager
     from src.security import verify_api_key # Import the new dependency
 except ImportError as e:
     # Log the specific import error
@@ -43,7 +44,7 @@ except ImportError as e:
     # Decide how to handle missing dependencies (exit, use dummies, etc.)
     # For now, let's define dummies to allow basic server startup for inspection
     class DatabaseManager: pass
-    async def get_db_manager(): return None
+    async def get_request_db_manager(): return None
     async def verify_api_key(): pass # Dummy dependency
     # sys.exit(1)
 
@@ -275,161 +276,160 @@ async def fix_python_code(code: str, filename: Optional[str] = None) -> CodeFixR
         except:
             pass
 
+# Error handling helper
+def handle_subprocess_error(e: subprocess.CalledProcessError, action: str) -> Dict[str, Any]:
+    logger.error(f"Error during {action}: {e.stderr}")
+    return {"success": False, "message": f"{action.capitalize()} failed", "details": e.stderr}
+
 @app.get("/")
-async def root():
+async def root(api_key: str = Depends(verify_api_key)):
     """Root endpoint for health check."""
     return {"service": "MCP Code Server", "status": "active"}
 
 @app.post("/analyze", response_model=CodeAnalysisResult)
-async def analyze_code(request: CodeAnalysisRequest, db: DatabaseManager = Depends(get_db_manager), api_key: str = Depends(verify_api_key)):
+async def analyze_code(request: CodeAnalysisRequest, db: DatabaseManager = Depends(get_request_db_manager), api_key: str = Depends(verify_api_key)):
     """Analyze code and return issues found."""
-    if request.language == CodeLanguage.PYTHON:
-        result = await analyze_python_code(request.code, request.filename)
-        
-        # Generate analysis ID
-        analysis_id = str(uuid.uuid4())
-        
-        # Store the analysis result in the database
-        await db.store_code_analysis(
-            analysis_id=analysis_id,
-            issues=result.issues,
-            formatted_code=result.formatted_code,
-            # code_id could be linked if snippet was stored first
-        )
-        
-        return result
-    else:
-        # For now, only Python is supported
-        # In the future, we can add support for other languages
-        return CodeAnalysisResult(issues=[], formatted_code=request.code)
+    try:
+        if request.language == CodeLanguage.PYTHON:
+            result = await analyze_python_code(request.code, request.filename)
+            # Check for internal errors signaled by the helper
+            if any(issue.get("code") == "MCP500" for issue in result.issues): # Ruff not found
+                raise HTTPException(status_code=500, detail="Server configuration error: Ruff executable not found.")
+            if any(issue.get("code") == "MCP501" for issue in result.issues): # Parse error
+                raise HTTPException(status_code=500, detail="Internal server error parsing analysis results.")
+            if any(issue.get("code") == "MCP502" for issue in result.issues): # Ruff check error
+                 raise HTTPException(status_code=500, detail=f"Ruff check execution failed: {result.issues[0].get('message', 'Unknown error')}")
+            if any(issue.get("code") == "MCP505" for issue in result.issues): # Unexpected error in helper
+                raise HTTPException(status_code=500, detail=f"Internal server error during analysis: {result.issues[0].get('message', 'Unknown error')}")
+
+            analysis_id = str(uuid.uuid4())
+            await db.store_code_analysis(analysis_id=analysis_id, issues=result.issues, formatted_code=result.formatted_code)
+            return result
+        else:
+            # Return empty result for non-Python, maybe raise 400 later if unsupported?
+            return CodeAnalysisResult(issues=[], formatted_code=request.code)
+    except HTTPException as e:
+        raise e # Re-raise specific HTTP exceptions from helper checks
+    except Exception as e:
+        logger.error(f"Unexpected error in /analyze endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
 @app.post("/format", response_model=CodeFormatResult)
-async def format_code(request: CodeFormatRequest, db: DatabaseManager = Depends(get_db_manager), api_key: str = Depends(verify_api_key)):
+async def format_code(request: CodeFormatRequest, db: DatabaseManager = Depends(get_request_db_manager), api_key: str = Depends(verify_api_key)):
     """Format code and return the formatted version."""
-    if request.language == CodeLanguage.PYTHON:
-        result = await analyze_python_code(request.code, request.filename)
+    try:
+        if request.language == CodeLanguage.PYTHON:
+            # analyze_python_code also handles formatting
+            analysis_result = await analyze_python_code(request.code, request.filename)
 
-        # Check if formatting specifically failed (MCP504)
-        format_failed = any(issue.get("code") == "MCP504" for issue in result.issues)
+            # Check for internal errors signaled by the helper
+            if any(issue.get("code") == "MCP500" for issue in analysis_result.issues): # Ruff not found
+                raise HTTPException(status_code=500, detail="Server configuration error: Ruff executable not found.")
+            if any(issue.get("code") == "MCP503" for issue in analysis_result.issues): # Error reading formatted file
+                 raise HTTPException(status_code=500, detail="Internal server error reading formatted code.")
+            if any(issue.get("code") == "MCP505" for issue in analysis_result.issues): # Unexpected error in helper
+                raise HTTPException(status_code=500, detail=f"Internal server error during formatting: {analysis_result.issues[0].get('message', 'Unknown error')}")
 
-        # Store analysis result regardless (useful for debugging maybe)
-        analysis_id = str(uuid.uuid4())
-        await db.store_code_analysis(
-            analysis_id=analysis_id,
-            issues=result.issues, # Store issues found, including format error
-            formatted_code=result.formatted_code, # Store original or formatted code
-        )
-
-        if format_failed:
-            # Find the specific error message if available
-            error_msg = "Formatting failed (likely syntax error)."
-            for issue in result.issues:
-                if issue.get("code") == "MCP504":
-                    error_msg = issue.get("message", error_msg)
-                    break
-            # Return an error structure, including the original code
-            return fastapi.responses.JSONResponse(
-                status_code=400, # Bad Request due to syntax error preventing format
-                content={
-                    "error": "Formatting failed",
-                    "details": error_msg,
-                    "formatted_code": request.code # Return original code on format failure
-                }
-            )
+            # Check if formatting specifically failed (MCP504)
+            format_failed = any(issue.get("code") == "MCP504" for issue in analysis_result.issues)
+            if format_failed:
+                error_msg = "Formatting failed (likely syntax error)."
+                for issue in analysis_result.issues:
+                    if issue.get("code") == "MCP504":
+                        error_msg = issue.get("message", error_msg)
+                        break
+                # Raise 400 for syntax errors preventing formatting
+                raise HTTPException(status_code=400, detail=error_msg)
+            
+            # Store analysis result (even if only formatting)
+            analysis_id = str(uuid.uuid4())
+            await db.store_code_analysis(analysis_id=analysis_id, issues=analysis_result.issues, formatted_code=analysis_result.formatted_code)
+            return {"formatted_code": analysis_result.formatted_code}
         else:
-             # Return successful formatting result
-            return {"formatted_code": result.formatted_code}
-    else:
-        # For now, only Python is supported
-        return {"formatted_code": request.code}
+            return {"formatted_code": request.code}
+    except HTTPException as e:
+        raise e # Re-raise specific HTTP exceptions
+    except Exception as e:
+        logger.error(f"Unexpected error in /format endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
 @app.post("/fix")
-async def fix_code(request: CodeAnalysisRequest, db: DatabaseManager = Depends(get_db_manager), api_key: str = Depends(verify_api_key)):
+async def fix_code(request: CodeAnalysisRequest, db: DatabaseManager = Depends(get_request_db_manager), api_key: str = Depends(verify_api_key)):
     """Analyze code, attempt to fix issues, and return the fixed code."""
-    if request.language == CodeLanguage.PYTHON:
-        result = await fix_python_code(request.code, request.filename)
-        
-        # Generate a unique ID for the fix attempt
-        fix_id = str(uuid.uuid4())
-        
-        # Store the result in the database
-        await db.store_code_fix(
-            fix_id=fix_id,
-            original_code=request.code,
-            language=request.language.value,
-            fixed_code=result.fixed_code,
-            issues_remaining=result.issues_remaining,
-            applied_fixes=result.applied_fixes
-        )
-        
-        return result
-    else:
-        # For now, only Python is supported
-        return CodeFixResult(fixed_code=request.code, issues_remaining=[], applied_fixes=[])
+    try:
+        if request.language == CodeLanguage.PYTHON:
+            result = await fix_python_code(request.code, request.filename)
+            
+            # Check for internal errors from helper
+            if any(issue.get("code") == "MCP500" for issue in result.issues_remaining): # Ruff not found
+                raise HTTPException(status_code=500, detail="Server configuration error: Ruff executable not found.")
+            # Add checks for other potential error codes from fix_python_code if implemented
+
+            fix_id = str(uuid.uuid4())
+            await db.store_code_fix(
+                fix_id=fix_id, original_code=request.code, language=request.language.value,
+                fixed_code=result.fixed_code, issues_remaining=result.issues_remaining, applied_fixes=result.applied_fixes
+            )
+            return result
+        else:
+            return CodeFixResult(fixed_code=request.code, issues_remaining=[], applied_fixes=[])
+    except HTTPException as e:
+        raise e # Re-raise specific HTTP exceptions
+    except Exception as e:
+        logger.error(f"Unexpected error in /fix endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
 @app.post("/snippets", response_model=CodeSnippet)
-async def store_snippet(request: StoreSnippetRequest, db: DatabaseManager = Depends(get_db_manager), api_key: str = Depends(verify_api_key)):
+async def store_snippet(request: StoreSnippetRequest, db: DatabaseManager = Depends(get_request_db_manager), api_key: str = Depends(verify_api_key)):
     """Store a code snippet and return its ID."""
     snippet_id = str(uuid.uuid4())
     snippet = CodeSnippet(
-        id=snippet_id,
-        code=request.code,
-        language=request.language.value,
-        metadata=request.metadata
+        id=snippet_id, code=request.code, language=request.language.value, metadata=request.metadata
     )
-    
     try:
-        # Store the snippet in the database
         await db.store_code_snippet(
-            snippet_id=snippet.id,
-            code=snippet.code,
-            language=snippet.language,
-            metadata=snippet.metadata
+            snippet_id=snippet.id, code=snippet.code, language=snippet.language, metadata=snippet.metadata
         )
         logger.info(f"Stored snippet {snippet_id}")
         return snippet
-    except Exception as e:
+    except Exception as e: # Catch generic DB errors
         logger.error(f"Database error storing snippet {snippet_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error storing snippet: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Database error storing snippet: {str(e)}")
 
 @app.get("/snippets/{snippet_id}", response_model=CodeSnippet)
-async def get_snippet(snippet_id: str, db: DatabaseManager = Depends(get_db_manager), api_key: str = Depends(verify_api_key)):
+async def get_snippet(snippet_id: str, db: DatabaseManager = Depends(get_request_db_manager), api_key: str = Depends(verify_api_key)):
     """Retrieve a stored code snippet by ID."""
     try:
         snippet = await db.get_code_snippet(snippet_id)
         if not snippet:
             logger.warning(f"Snippet {snippet_id} not found in DB.")
             raise HTTPException(status_code=404, detail=f"Snippet {snippet_id} not found")
-        # Assuming db.get_code_snippet returns a dict-like object matching CodeSnippet
         return snippet
     except HTTPException as http_exc:
-        # Re-raise expected HTTP exceptions (like 404)
-        raise http_exc
-    except Exception as e:
-        # Catch other unexpected errors (like DB connection errors)
-        logger.error(f"Unexpected error retrieving snippet {snippet_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Internal server error retrieving snippet: {str(e)}")
+        raise http_exc # Re-raise 404
+    except Exception as e: # Catch generic DB errors
+        logger.error(f"Database error retrieving snippet {snippet_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Database error retrieving snippet: {str(e)}")
 
 @app.get("/snippets")
-async def list_snippets(db: DatabaseManager = Depends(get_db_manager), api_key: str = Depends(verify_api_key)):
+async def list_snippets(db: DatabaseManager = Depends(get_request_db_manager), api_key: str = Depends(verify_api_key)):
     """List all stored code snippet IDs."""
     try:
         snippets = await db.list_code_snippets()
-        # Ensure snippets is a list, default to empty list if None
         snippet_list = snippets if snippets is not None else []
         return {"snippet_ids": [s["id"] for s in snippet_list]}
-    except Exception as e:
+    except Exception as e: # Catch generic DB errors
         logger.error(f"Database error listing snippets: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error listing snippets: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Database error listing snippets: {str(e)}")
 
 # Set up application startup/shutdown lifecycle using lifespan context manager (preferred over on_event)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Connect to DB and ensure tables
+    # Startup: Connect to DB and ensure tables using the singleton manager
     db_manager = get_db_manager()
     try:
         await db_manager.connect()
-        await db_manager.create_tables() # Use the correct method name
+        await db_manager._create_tables()
         logger.info("Database connected and tables ensured during startup.")
     except Exception as e:
         logger.error(f"Database initialization failed during startup: {e}", exc_info=True)
@@ -438,8 +438,8 @@ async def lifespan(app: FastAPI):
     
     yield # Application runs here
     
-    # Shutdown: Disconnect from DB
-    if db_manager and db_manager.is_connected:
+    # Shutdown: Disconnect from DB using the same singleton manager
+    if db_manager and db_manager.conn:
         try:
             await db_manager.disconnect()
             logger.info("Database disconnected during shutdown.")
@@ -451,5 +451,8 @@ app.router.lifespan_context = lifespan
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("MCP_CODE_SERVER_PORT", 8000))
-    uvicorn.run("mcp_code_server:app", host="0.0.0.0", port=port, reload=True) 
+    # Read port from environment variable, default to 8081 if not set
+    DEFAULT_PORT = 8081
+    PORT = int(os.environ.get("MCP_CODE_PORT", DEFAULT_PORT))
+    logger.info(f"Starting MCP Code Server on port {PORT}")
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info") 

@@ -14,6 +14,7 @@ import json
 import asyncio
 import argparse
 from typing import Dict, Any, Optional, List
+from pathlib import Path
 
 # Add the src directory to the path so we can import the MCP enhanced agent
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -21,7 +22,8 @@ from src.mcp_enhanced_agent import MCPEnhancedAgent
 
 # Default URLs for the MCP servers, can be overridden by environment variables
 MCP_CODE_SERVER_URL = os.environ.get("MCP_CODE_SERVER_URL", "http://localhost:8000")
-MCP_TEST_SERVER_URL = os.environ.get("MCP_TEST_SERVER_URL", "http://localhost:8001")
+MCP_TEST_SERVER_URL = os.environ.get("MCP_TEST_SERVER_URL", "http://localhost:8082")
+API_KEY = os.environ.get("MCP_API_KEY", "test-key") # Replace with your actual API key
 
 # Sample code with various issues for demonstration
 SAMPLE_CODE = """

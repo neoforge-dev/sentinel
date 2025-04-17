@@ -17,9 +17,12 @@ import json
 import requests
 from enum import Enum
 from typing import Dict, List, Optional, Any, Union
+import asyncio
+import aiohttp
 
 # Get the MCP Test Server URL from environment or use default
-MCP_TEST_SERVER_URL = os.environ.get("MCP_TEST_SERVER_URL", "http://localhost:8001")
+MCP_TEST_SERVER_URL = os.environ.get("MCP_TEST_SERVER_URL", "http://localhost:8082")
+API_KEY = os.environ.get("MCP_API_KEY", "test-key")  # Replace with your actual API key
 
 
 class TestRunner(str, Enum):

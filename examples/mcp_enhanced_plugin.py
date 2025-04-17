@@ -17,6 +17,7 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Callable, Union
 import asyncio
+import aiohttp
 
 # Add the src directory to the path so we can import the MCP enhanced agent
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -29,9 +30,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mcp_enhanced_plugin")
 
-# Default URLs for the MCP servers, can be overridden by environment variables
-MCP_CODE_SERVER_URL = os.environ.get("MCP_CODE_SERVER_URL", "http://localhost:8000")
-MCP_TEST_SERVER_URL = os.environ.get("MCP_TEST_SERVER_URL", "http://localhost:8001")
+# Configuration
+MCP_CODE_SERVER_URL = os.environ.get("MCP_CODE_SERVER_URL", "http://localhost:8081")
+MCP_TEST_SERVER_URL = os.environ.get("MCP_TEST_SERVER_URL", "http://localhost:8082")
+API_KEY = os.environ.get("MCP_API_KEY", "test-key") # Replace with your actual API key
 
 # Initialize the enhanced agent
 agent = MCPEnhancedAgent(

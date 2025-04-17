@@ -11,11 +11,14 @@ import sys
 import asyncio
 import argparse
 from pprint import pprint
+import traceback # For printing traceback on error
 
 # Add the parent directory to sys.path to import the agent
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.mcp_enhanced_agent import MCPEnhancedAgent
+# Import the new tool function
+from tools.weather_tool import get_current_weather
 
 # Sample code with issues for demonstration
 SAMPLE_CODE_WITH_ISSUES = """
@@ -127,6 +130,30 @@ async def demo_test_execution(agent, project_path):
         for test in last_failed:
             print(f"- {test}")
 
+# New function to demo tool execution
+async def demo_tool_execution(agent):
+    """Demonstrate external tool execution."""
+    print("\n=== Tool Execution Demo (Weather) ===\n")
+    location = "London,UK" # Example location
+    print(f"Attempting to get weather for: {location}")
+    
+    # Execute the tool via the agent
+    # Note: Ensure OPENWEATHERMAP_API_KEY is set in your environment
+    weather_result = await agent.execute_tool("get_weather", location=location)
+    
+    if weather_result.get("success"):
+        print("\nWeather Result:")
+        pprint(weather_result.get("result", {}))
+    else:
+        print(f"\nError getting weather: {weather_result.get('error')}")
+    
+    print("\nAttempting to execute a non-existent tool...")
+    non_existent_result = await agent.execute_tool("non_existent_tool", arg1="test")
+    if not non_existent_result.get("success"):
+        print(f"Successfully handled non-existent tool: {non_existent_result.get('error')}")
+    else:
+        print("Error: Agent reported success for non-existent tool!")
+
 async def main():
     """Run the MCP Enhanced Agent demo."""
     parser = argparse.ArgumentParser(description='MCP Enhanced Agent Demo')
@@ -138,24 +165,31 @@ async def main():
 
     # Create the enhanced agent
     agent = MCPEnhancedAgent(
-        code_server_url=args.code_server,
-        test_server_url=args.test_server
+        # Use environment variables or defaults if args not provided
+        code_server_url=args.code_server or os.environ.get("MCP_CODE_SERVER_URL", "http://localhost:8000"),
+        test_server_url=args.test_server or os.environ.get("MCP_TEST_SERVER_URL", "http://localhost:8082")
     )
     
-    try:
-        # Demo code analysis capabilities
-        await demo_code_analysis(agent)
-        
-        # Demo test execution capabilities
-        await demo_test_execution(agent, args.project_path)
+    # Register the weather tool
+    agent.register_tool("get_weather", get_current_weather)
     
-    except Exception as e:
-        print(f"Error: {e}")
-        print("\nMake sure MCP code and test servers are running.")
-        print("You can start them with:")
-        print("  1. python agents/mcp_code_server.py")
-        print("  2. python agents/mcp_test_server.py")
+    async with agent: # Use agent as context manager
+        try:
+            # Demo code analysis capabilities
+            await demo_code_analysis(agent)
+            
+            # Demo test execution capabilities
+            await demo_test_execution(agent, args.project_path)
+            
+            # Demo tool execution capabilities
+            await demo_tool_execution(agent)
         
+        except Exception as e:
+            print(f"An error occurred during the demo: {e}")
+            print(traceback.format_exc()) # Print full traceback for debugging
+            print("\nMake sure MCP code and test servers are running and reachable.")
+            print("Also ensure the OPENWEATHERMAP_API_KEY environment variable is set for the weather tool.")
+            
     print("\nDemo complete!")
 
 if __name__ == "__main__":

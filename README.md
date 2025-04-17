@@ -1,5 +1,7 @@
 # BaseAgent: Ollama + UV + MCP Integration
 
+[![Python CI](https://github.com/USER/REPO/actions/workflows/ci.yml/badge.svg)](https://github.com/USER/REPO/actions/workflows/ci.yml)
+
 A powerful AI project that combines:
 - [Ollama](https://github.com/ollama/ollama) for running local LLMs
 - [UV](https://github.com/astral-sh/uv) for Python dependency management
@@ -79,7 +81,7 @@ This project utilizes specialized MCP servers for different backend tasks. They 
   ```bash
   python agents/mcp_code_server.py
   ```
-- **Default Port**: 8000 (Configurable via `MCP_CODE_SERVER_PORT` env var)
+- **Default Port**: 8081 (Configurable via `MCP_CODE_PORT` env var)
 - **Key Endpoints**:
     - `POST /analyze`: Analyze code for issues.
     - `POST /format`: Format code.
@@ -87,22 +89,14 @@ This project utilizes specialized MCP servers for different backend tasks. They 
     - `POST /snippets`: Store a code snippet.
     - `GET /snippets/{id}`: Retrieve a code snippet.
     - `GET /snippets`: List snippet IDs.
-- **API Docs**: http://localhost:8000/docs (when running)
+- **API Docs**: http://localhost:8081/docs (when running)
 
 ### 2. MCP Test Server
 
-- **Purpose**: Runs tests within a specified project directory, supporting local execution or Docker containers. Provides cleaned-up, token-limited output suitable for LLMs.
-- **Run**: 
-  ```bash
-  python agents/mcp_test_server.py
-  ```
-- **Default Port**: 8001 (Configurable via `MCP_TEST_SERVER_PORT` env var)
-- **Key Endpoints**:
-    - `POST /run`: Execute tests based on provided configuration.
-    - `GET /result/{id}`: Get the results of a specific test run.
-    - `GET /results`: List recent test run IDs.
-    - `GET /last_failed`: Get the list of tests that failed in the last run.
-- **API Docs**: http://localhost:8001/docs (when running)
+- **Purpose**: Runs tests (pytest, unittest, nose2) locally or in Docker.
+- **Default Port**: 8082 (Configurable via `MCP_TEST_PORT` env var)
+- **API Docs**: http://localhost:8082/docs (when running)
+- **Key Features**: Local/Docker execution, result persistence, output streaming, multiple runners.
 
 ## Usage
 
@@ -135,11 +129,22 @@ The `uvicorn.run` command in the server scripts includes `reload=True` by defaul
 
 ## Troubleshooting
 
-- **Server Connection Issues**: Ensure the respective MCP servers are running. Check the host and port configured in your client or the `.env` file (defaults are `localhost:8000` for code, `localhost:8001` for test).
+- **Server Connection Issues**: Ensure the respective MCP servers are running. Check the host and port configured in your client or the `.env` file (defaults are `localhost:8081` for code, `localhost:8082` for test).
 - **`ruff` not found**: Make sure `ruff` is installed (`uv pip install ruff` or `pip install ruff`) and accessible in your PATH.
 - **Database Errors**: If you encounter issues, you can try deleting the `data/mcp.db` file. The servers will recreate it on startup.
 - **Docker Test Errors**: Ensure Docker Desktop (or Docker Engine) is running if you are using the 'docker' mode for the test server.
+- **Weather Tool Errors**: The `mcp_enhanced_agent_demo.py` uses a weather tool (`tools/weather_tool.py`) that requires an API key from [OpenWeatherMap](https://openweathermap.org/appid). Sign up for a free key and set the `OPENWEATHERMAP_API_KEY` environment variable.
 
 ## License
 
 MIT License
+
+```bash
+export MCP_API_KEY="your-secret-key"
+export MCP_CODE_SERVER_URL="http://localhost:8081"
+export MCP_TEST_SERVER_URL="http://localhost:8082"
+ollama serve &
+./run_mcp_server.sh --server code &
+./run_mcp_server.sh --server test &
+streamlit run ui/app.py
+```

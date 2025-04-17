@@ -48,7 +48,7 @@ The testing system consists of three main components:
    python agents/mcp_test_server.py
    ```
 
-The server will start on http://localhost:8001 by default.
+The server will start on http://localhost:8082 by default.
 
 ## API Endpoints
 
@@ -190,4 +190,26 @@ result = agent.run_tests(
 - Support for additional test frameworks
 - Test coverage reporting
 - Performance profiling
-- Integration with CI/CD systems 
+- Integration with CI/CD systems
+
+### Running the Server
+
+To run the server:
+
+```bash
+# Set the API key (optional, defaults to 'test-key')
+export MCP_API_KEY="your-secret-key"
+
+# Set the port (optional, defaults to 8082)
+export MCP_TEST_PORT=8082
+
+# Navigate to the project root directory
+cd /path/to/base-agent
+
+# Run using uvicorn
+python agents/mcp_test_server.py
+# Or directly with uvicorn for more options (like reload)
+# uvicorn agents.mcp_test_server:app --host 0.0.0.0 --port 8082 --reload
+```
+
+The server will start on http://localhost:8082 by default. 

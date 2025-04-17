@@ -1,0 +1,130 @@
+name: Python CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read # Allow reading repo content
+
+jobs:
+  lint:
+    name: Lint Code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11" # Or your project's version
+
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+        env:
+          UV_TOOLCHAIN: "uv"
+
+      - name: Install dependencies (including ruff)
+        run: |
+          source $HOME/.cargo/env
+          uv pip install -r requirements.txt
+
+      - name: Run Ruff Check
+        run: |
+          source $HOME/.cargo/env
+          uv run ruff check .
+
+      - name: Run Ruff Format Check
+        run: |
+          source $HOME/.cargo/env
+          uv run ruff format --check .
+
+  test:
+    name: Run Tests
+    needs: lint # Ensure lint passes before testing
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11" # Match lint job
+
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+        env:
+          UV_TOOLCHAIN: "uv"
+
+      - name: Install dependencies
+        run: |
+          source $HOME/.cargo/env
+          uv pip install -r requirements.txt
+          # Ensure test dependencies like pytest are installed
+
+      - name: Run Pytest
+        run: |
+          source $HOME/.cargo/env
+          # Set the API key for tests that might need it
+          # Use a dummy key for CI
+          export MCP_API_KEY="ci_dummy_key" 
+          uv run pytest -xvs --cov=. --cov-report=xml
+          # -x: stop on first failure
+          # -v: verbose
+          # -s: show print statements
+          # --cov: generate coverage report
+
+      # Optional: Upload coverage report (e.g., to Codecov)
+      # - name: Upload coverage reports to Codecov
+      #   uses: codecov/codecov-action@v4.0.1
+      #   with:
+      #     token: ${{ secrets.CODECOV_TOKEN }} # Store token in GitHub secrets
+      #     slug: your_org/your_repo # Replace with your repo slug
+
+  deploy:
+    name: Deploy to GHCR
+    needs: test # Run only after lint and test succeed
+    runs-on: ubuntu-latest
+    # Run only on pushes to the main branch
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write # Needed to push packages to GHCR
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push MCP Code Server
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./agents/Dockerfile.code_server
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/mcp-code-server:latest
+            ghcr.io/${{ github.repository }}/mcp-code-server:${{ github.sha }}
+
+      - name: Build and push MCP Test Server
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./agents/Dockerfile.test_server
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/mcp-test-server:latest
+            ghcr.io/${{ github.repository }}/mcp-test-server:${{ github.sha }}

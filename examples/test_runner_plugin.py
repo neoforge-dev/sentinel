@@ -8,9 +8,11 @@ import os
 import sys
 import json
 import requests
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, AsyncGenerator
 import logging
 import re
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import httpx
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -38,6 +40,11 @@ except Exception as e:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Retry settings
+MAX_RETRIES = 3
+RETRY_WAIT_MULTIPLIER = 1
+RETRY_MAX_WAIT = 10
+
 # Helper to get headers
 def _get_headers() -> Dict[str, str]:
     """Returns headers for MCP requests, including API key if available."""
@@ -47,21 +54,31 @@ def _get_headers() -> Dict[str, str]:
         headers["X-API-Key"] = api_key
     return headers
 
-def run_tests_with_mcp(
+@retry(
+    stop=stop_after_attempt(MAX_RETRIES),
+    wait=wait_exponential(multiplier=RETRY_WAIT_MULTIPLIER, max=RETRY_MAX_WAIT),
+    retry=retry_if_exception_type(requests.RequestException)
+)
+async def run_tests_with_mcp(
     project_path: str,
     test_path: str = "tests",
     runner: str = "pytest",
     mode: str = "local",
+    docker_image: Optional[str] = None,
     max_failures: Optional[int] = None,
     run_last_failed: bool = False,
+    additional_args: List[str] = [],
     timeout: int = 300,
-    max_tokens: int = 4000,
-    docker_image: Optional[str] = None,
-    additional_args: Optional[List[str]] = None
-) -> Dict[str, Any]:
-    """Runs tests using the MCP Test Server. Handles streaming for local mode."""
+    max_tokens: int = 4000
+) -> AsyncGenerator[str, None]:
+    """
+    Runs tests using the MCP Test Server, yielding output lines.
+    Handles both streaming (local, docker) and potential errors.
+    """
     endpoint = f"{MCP_TEST_SERVER_URL}/run-tests"
-    payload = {
+    headers = _get_headers()
+    
+    request_data = {
         "project_path": project_path,
         "test_path": test_path,
         "runner": runner,
@@ -73,55 +90,74 @@ def run_tests_with_mcp(
         "docker_image": docker_image,
         "additional_args": additional_args
     }
+
     try:
-        # Use stream=True for potential streaming response
-        response = requests.post(endpoint, json=payload, headers=_get_headers(), stream=(mode == 'local')) 
-        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-        
-        if mode == 'local' and response.headers.get("content-type") == "text/plain":
-            # Handle streaming response
-            final_result_summary = {"status": "unknown", "summary": "Processing stream...", "id": "unknown"}
-            print("--- Streaming Test Output --- ")
-            full_output = ""
-            for line in response.iter_lines(decode_unicode=True):
-                if line:
-                    print(line) # Print stream line by line
-                    full_output += line + "\n"
-                    # Attempt to parse final status line (example)
-                    if line.startswith("--- Test run complete"): 
-                        match = re.search(r"\((.*?)\). Status: (\w+)", line)
-                        if match:
-                            final_result_summary["id"] = match.group(1)
-                            final_result_summary["status"] = match.group(2)
-                            final_result_summary["summary"] = f"Run {match.group(1)} completed with status {match.group(2)}."
-            print("--- End of Stream --- ")
-            
-            # Return a summary based on the stream, as the full JSON might not be available
-            # Or potentially fetch the full result using the ID if needed
-            return { # Return summary derived from stream
-                "status": final_result_summary["status"],
-                "summary": final_result_summary["summary"],
-                "details": full_output,
-                "result_id": final_result_summary["id"]
-            }
-        else:
-            # Handle non-streaming response (e.g., Docker mode or error)
-            return response.json()
-        
-    except requests.exceptions.ConnectionError as e:
-        logger.error(f"Connection error running tests at {endpoint}: {e}")
-        return {"status": "error", "summary": f"Connection error contacting Test MCP server at {endpoint}", "details": str(e)}
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP error running tests at {endpoint}: {e.response.status_code} - {e.response.text}")
-        return {"status": "error", "summary": f"HTTP error {e.response.status_code} from Test MCP server at {endpoint}", "details": e.response.text}
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error running tests via MCP: {e}", exc_info=True)
-        return {"status": "error", "summary": f"MCP request failed: {e}", "details": str(e)}
+        # Use stream=True for the request
+        async with httpx.AsyncClient(timeout=timeout + 10) as client: # Slightly longer timeout for client
+            async with client.stream("POST", endpoint, json=request_data, headers=headers) as response:
+                
+                # Check for non-200 status codes before streaming
+                if response.status_code != 200:
+                    error_text = await response.aread()
+                    error_text = error_text.decode('utf-8', errors='replace')
+                    logger.error(f"HTTP error running tests at {endpoint}: {response.status_code} - {error_text}")
+                    summary = f"HTTP error {response.status_code} from Test MCP server"
+                    if response.status_code == 401:
+                        summary = "Authentication error: Invalid API Key?"
+                    elif response.status_code == 404:
+                        summary = "Test MCP server endpoint not found"
+                    elif response.status_code == 400:
+                        summary = f"Bad Request: {error_text[:100]}..."
+                    elif response.status_code == 422:
+                        summary = f"Invalid request payload: {error_text[:100]}..."
+                    elif response.status_code >= 500:
+                        summary = "Test MCP server internal error"
+                    yield f"--- SERVER ERROR {response.status_code}: {summary} ---"
+                    yield f"DETAILS: {error_text}"
+                    return # Stop generation on error
 
+                # Stream the response content line by line
+                async for line in response.aiter_lines():
+                    yield line
+                    
+    # --- Exception Handling --- 
+    # Keep existing exception handling, but yield error messages instead of returning dicts
+    except httpx.TimeoutException:
+        logger.error(f"Timeout connecting to Test MCP server at {endpoint}")
+        yield "--- ERROR: Timeout connecting to Test MCP server ---"
+    except httpx.ConnectError:
+        logger.error(f"Connection error for Test MCP server at {endpoint}")
+        yield "--- ERROR: Could not connect to Test MCP server ---"
+    except httpx.HTTPStatusError as e: # Should be caught by status check above, but keep as fallback
+        status_code = e.response.status_code
+        error_text = e.response.text
+        logger.error(f"HTTP error running tests at {endpoint}: {status_code} - {error_text}")
+        summary = f"HTTP error {status_code} from Test MCP server"
+        if status_code == 401:
+            summary = "Authentication error: Invalid API Key?"
+        elif status_code == 404:
+            summary = "Test MCP server endpoint not found"
+        elif status_code == 422:
+            summary = "Invalid request payload (check parameters)"
+        elif status_code >= 500:
+            summary = "Test MCP server internal error"
+        yield f"--- SERVER ERROR {status_code}: {summary} ---"
+        yield f"DETAILS: {error_text}"
+    except httpx.RequestError as e:
+        logger.error(f"Request error interacting with Test MCP server: {e}")
+        yield f"--- ERROR: Network request failed ({type(e).__name__}) ---"
+    except Exception as e:
+        logger.error(f"Unexpected error in run_tests_with_mcp: {e}", exc_info=True)
+        yield f"--- UNEXPECTED PLUGIN ERROR: {type(e).__name__}: {e} ---"
 
+@retry(
+    stop=stop_after_attempt(MAX_RETRIES),
+    wait=wait_exponential(multiplier=RETRY_WAIT_MULTIPLIER, max=RETRY_MAX_WAIT),
+    retry=retry_if_exception_type(requests.RequestException)
+)
 def get_last_failed_tests_with_mcp() -> Dict[str, Any]:
     """
-    Get the list of last failed tests
+    Get the list of last failed tests (with retry)
     """
     # Need project_path for the server endpoint
     # This tool might need refinement if project_path isn't available
@@ -141,16 +177,32 @@ def get_last_failed_tests_with_mcp() -> Dict[str, Any]:
         logger.error(f"Connection error getting last failed tests at {url}: {e}")
         return {"status": "error", "summary": f"Connection error contacting Test MCP server at {url}", "details": str(e)}
     except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP error getting last failed tests at {url}: {e.response.status_code} - {e.response.text}")
-        return {"status": "error", "summary": f"HTTP error {e.response.status_code} from Test MCP server at {url}", "details": e.response.text}
+        status_code = e.response.status_code
+        error_text = e.response.text
+        logger.error(f"HTTP error getting last failed tests at {url}: {status_code} - {error_text}")
+        summary = f"HTTP error {status_code} from Test MCP server"
+        if status_code == 401:
+            summary = "Authentication error: Invalid API Key?"
+        elif status_code == 404:
+            summary = "Test MCP server endpoint not found"
+        elif status_code == 422: # e.g., missing project_path
+            summary = "Invalid request (missing parameters?)"
+        elif status_code >= 500:
+            summary = "Test MCP server internal error"
+            
+        return {"status": "error", "summary": summary, "details": error_text}
     except requests.exceptions.RequestException as e:
         logger.error(f"Error getting last failed tests for {project_path} via MCP: {e}", exc_info=True)
         return {"status": "error", "summary": f"Failed to get last failed tests: {e}", "details": str(e)}
 
-
+@retry(
+    stop=stop_after_attempt(MAX_RETRIES),
+    wait=wait_exponential(multiplier=RETRY_WAIT_MULTIPLIER, max=RETRY_MAX_WAIT),
+    retry=retry_if_exception_type(requests.RequestException)
+)
 def get_test_result_with_mcp(result_id: str) -> Dict[str, Any]:
     """
-    Get a specific test result
+    Get a specific test result (with retry)
     """
     url = f"{MCP_TEST_SERVER_URL}/results/{result_id}"
     
@@ -163,14 +215,21 @@ def get_test_result_with_mcp(result_id: str) -> Dict[str, Any]:
         logger.error(f"Connection error getting result {result_id} at {url}: {e}")
         return {"status": "error", "summary": f"Connection error contacting Test MCP server at {url}", "details": str(e)}
     except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP error getting result {result_id} at {url}: {e.response.status_code} - {e.response.text}")
-        if e.response.status_code == 404:
-            return {"status": "error", "summary": f"Test result {result_id} not found", "details": e.response.text}
-        return {"status": "error", "summary": f"HTTP error {e.response.status_code} from Test MCP server at {url}", "details": e.response.text}
+        status_code = e.response.status_code
+        error_text = e.response.text
+        logger.error(f"HTTP error getting result {result_id} at {url}: {status_code} - {error_text}")
+        summary = f"HTTP error {status_code} from Test MCP server"
+        if status_code == 401:
+            summary = "Authentication error: Invalid API Key?"
+        elif status_code == 404:
+            summary = f"Test result {result_id} not found"
+        elif status_code >= 500:
+            summary = "Test MCP server internal error"
+            
+        return {"status": "error", "summary": summary, "details": error_text}
     except requests.exceptions.RequestException as e:
         logger.error(f"Error getting test result {result_id} via MCP: {e}", exc_info=True)
         return {"status": "error", "summary": f"Failed to get result {result_id}: {e}", "details": str(e)}
-
 
 def apply_fix_and_retest(code: str, file_path: str, project_path: str) -> Dict[str, Any]:
     """
@@ -268,7 +327,6 @@ def apply_fix_and_retest(code: str, file_path: str, project_path: str) -> Dict[s
         if backup_file and os.path.exists(backup_file):
             shutil.copy2(backup_file, full_path)
             os.unlink(backup_file)
-
 
 def analyze_test_failures(project_path: str) -> Dict[str, Any]:
     """
@@ -371,7 +429,6 @@ def analyze_test_failures(project_path: str) -> Dict[str, Any]:
             "test_result": result
         }
 
-
 def register_test_tools(agent: OllamaAgent):
     """
     Register test running and analysis tools with the agent
@@ -428,7 +485,6 @@ def register_test_tools(agent: OllamaAgent):
             function=analyze_test_failures
         )
     )
-
 
 if __name__ == "__main__":
     # Example usage

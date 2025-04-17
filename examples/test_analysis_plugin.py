@@ -14,9 +14,14 @@ import sys
 import json
 from typing import Dict, List, Optional, Any, Union
 import requests
+import aiohttp
+import asyncio
 
-# Default MCP test server URL, can be overridden by environment variable
-MCP_TEST_SERVER_URL = os.environ.get("MCP_TEST_SERVER_URL", "http://localhost:8001")
+# --- Configuration ---
+MCP_CODE_SERVER_URL = os.environ.get("MCP_CODE_SERVER_URL", "http://localhost:8081")
+MCP_TEST_SERVER_URL = os.environ.get("MCP_TEST_SERVER_URL", "http://localhost:8082")
+API_KEY = os.environ.get("MCP_API_KEY", "test-key")  # Replace with your actual API key
+# --- End Configuration ---
 
 # Enums for test runner and execution mode
 class TestRunner:

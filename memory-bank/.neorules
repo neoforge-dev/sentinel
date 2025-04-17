@@ -10,6 +10,8 @@
 - **Plugin System**: Use a plugin registration pattern for extending agent capabilities
 - **Specialized Servers**: Create purpose-specific MCP servers rather than one monolithic server
 - **Token Budget**: Use token counting to optimize output for LLM consumption
+- **Import Path Requirement**: All scripts that import from `src` must be run with the current directory (`.`) in `PYTHONPATH` (e.g., `PYTHONPATH=.:src:agents ...`). This is required for `from src...` imports to work when running scripts directly.
+- **Running Package Modules**: For scripts within package directories (like `agents/`) that import from other top-level packages (like `src/`), the idiomatic way to run them from the project root is using `python -m package_name.module_name` (e.g., `python -m agents.mcp_test_server`). This ensures Python correctly recognizes the project root and handles imports.
 
 ## User Preferences
 

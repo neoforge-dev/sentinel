@@ -10,8 +10,10 @@ import tempfile
 import shutil
 import pytest
 import unittest
-from unittest.mock import patch, MagicMock, call, mock_open
+from unittest.mock import patch, MagicMock, call, mock_open, AsyncMock
 import requests
+import httpx
+import asyncio
 
 # Add the parent directory to the path so we can import the modules
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
@@ -90,72 +92,123 @@ def mock_agent():
     return MockOllamaAgent()
 
 
-@patch("examples.test_runner_plugin.requests.post")
-def test_run_tests_success(mock_post):
-    """Test successful test execution"""
-    # Mock response data
-    mock_data = {
-        "id": "test-run-123",
-        "status": "failure",
-        "summary": "1 passed, 1 failed",
-        "details": "Test details",
-        "passed_tests": ["test_passing"],
-        "failed_tests": ["test_failing"],
-        "skipped_tests": []
-    }
+@pytest.fixture
+def set_api_key_env():
+    """Fixture to temporarily set the AGENT_API_KEY environment variable."""
+    api_key = "test-plugin-key-123"
+    original_value = os.environ.get("AGENT_API_KEY")
+    os.environ["AGENT_API_KEY"] = api_key
+    yield api_key # Provide the key to the test if needed
+    # Teardown: restore original value or remove if it didn't exist
+    if original_value is None:
+        del os.environ["AGENT_API_KEY"]
+    else:
+        os.environ["AGENT_API_KEY"] = original_value
+
+
+@pytest.mark.asyncio
+@patch("examples.test_runner_plugin.httpx.AsyncClient")
+async def test_run_tests_success(MockAsyncClient, set_api_key_env):
+    """Test successful streaming test execution and API key header."""
+    # Mock response data (for streaming)
+    mock_stream_lines = [
+        "--- Starting test run (mock-id-1) ---",
+        "STDOUT: Test 1 passed",
+        "--- Test run complete (mock-id-1). Status: success ---"
+    ]
     
-    # Set up the mock
-    mock_post.return_value = MockResponse(200, mock_data)
-    
-    # Call the function
-    result = run_tests_with_mcp(
+    # Setup mock response
+    mock_response = AsyncMock(spec=httpx.Response)
+    mock_response.status_code = 200
+    mock_response.headers = {"content-type": "text/plain; charset=utf-8"}
+    async def mock_aiter_lines():
+        for line in mock_stream_lines:
+            yield line
+    mock_response.aiter_lines = mock_aiter_lines
+
+    # Setup mock stream context manager
+    mock_stream_cm = AsyncMock()
+    mock_stream_cm.__aenter__.return_value = mock_response
+    mock_stream_cm.__aexit__.return_value = None
+
+    # Setup mock client instance that stream() returns context manager
+    mock_client_instance = MagicMock()
+    mock_client_instance.stream.return_value = mock_stream_cm
+
+    # Configure the MockAsyncClient class patch
+    # Make httpx.AsyncClient() return an object whose __aenter__ returns our mock_client_instance
+    mock_async_client_context = AsyncMock()
+    mock_async_client_context.__aenter__.return_value = mock_client_instance
+    mock_async_client_context.__aexit__.return_value = None
+    MockAsyncClient.return_value = mock_async_client_context
+
+    # Call the async generator function
+    result_generator = run_tests_with_mcp(
         project_path="/tmp/test_project",
         test_path="tests",
         runner="pytest",
         mode="local",
         max_failures=1
     )
-    
-    # Verify the results
-    assert result["id"] == mock_data["id"]
-    assert result["status"] == mock_data["status"]
-    assert result["passed_tests"] == mock_data["passed_tests"]
-    assert result["failed_tests"] == mock_data["failed_tests"]
-    
-    # Verify the request
-    mock_post.assert_called_once()
-    args, kwargs = mock_post.call_args
-    assert args[0].endswith("/run-tests")
-    assert kwargs["json"]["project_path"].endswith("test_project")
-    assert kwargs["json"]["test_path"] == "tests"
-    assert kwargs["json"]["runner"] == "pytest"
-    assert kwargs["json"]["mode"] == "local"
-    assert kwargs["json"]["max_failures"] == 1
+
+    # Consume the generator
+    output_lines = []
+    async for line in result_generator:
+        output_lines.append(line)
+
+    # Verify the output lines contain expected content
+    assert any("Status: success" in line for line in output_lines)
+    assert any("mock-id-1" in line for line in output_lines)
+
+    # Verify the mock client.stream was called correctly
+    mock_client_instance.stream.assert_called_once()
+    call_args, call_kwargs = mock_client_instance.stream.call_args
+    assert call_args[0] == "POST" # Method
+    assert MOCK_URL in call_args[1] # URL
+    # Use os.environ.get inside the test as the fixture modifies it
+    expected_key = os.environ.get("AGENT_API_KEY") 
+    assert call_kwargs['headers']["X-API-Key"] == expected_key
+    assert call_kwargs['json']["project_path"] == "/tmp/test_project"
 
 
-@patch("examples.test_runner_plugin.requests.post")
-def test_run_tests_error(mock_post):
+@pytest.mark.asyncio
+@patch("examples.test_runner_plugin.httpx.AsyncClient")
+async def test_run_tests_error(MockAsyncClient):
     """Test test execution with a connection error"""
-    # Mock a connection error
-    error_message = "Connection error"
-    mock_post.side_effect = requests.RequestException(error_message)
+    # Mock a connection error when client.stream is called
+    error_message = "Connection refused"
     
-    # Call the function and check it handles the error
-    result = run_tests_with_mcp(
+    # Setup mock client instance to raise error on stream call
+    mock_client_instance = MagicMock()
+    # Make the stream() method itself raise the error
+    mock_client_instance.stream.side_effect = httpx.RequestError(error_message)
+
+    # Configure the MockAsyncClient class patch
+    mock_async_client_context = AsyncMock()
+    mock_async_client_context.__aenter__.return_value = mock_client_instance
+    mock_async_client_context.__aexit__.return_value = None
+    MockAsyncClient.return_value = mock_async_client_context
+
+    # Call the async generator
+    result_generator = run_tests_with_mcp(
         project_path="/tmp/test_project",
         test_path="tests"
     )
-    
-    # Verify the error structure: {success: False, status: 'error', message: ..., details: ...}
-    assert result["status"] == "error"
-    assert "error" in result["summary"].lower()
-    assert error_message in result["details"]
-    assert "summary" not in result # Ensure summary isn't present on error
+
+    # Consume the generator and verify the error structure
+    output_lines = []
+    async for line in result_generator:
+        output_lines.append(line)
+
+    assert len(output_lines) == 1 # Should only yield the error line
+    # Check for the specific error yielded by the except block
+    assert "--- ERROR: Network request failed" in output_lines[0]
+    assert "RequestError" in output_lines[0]
 
 
 @patch("examples.test_runner_plugin.requests.get")
-def test_get_last_failed_tests_success(mock_get):
-    """Test getting the last failed tests"""
+def test_get_last_failed_tests_success(mock_get, set_api_key_env):
+    """Test getting the last failed tests and API key header."""
     # Mock response data
     mock_data = ["test_one", "test_two"]
     
@@ -169,12 +222,14 @@ def test_get_last_failed_tests_success(mock_get):
     assert result["success"] is True
     assert result["failed_tests"] == mock_data
     
-    # Verify the request URL (ignoring query params for simplicity for now)
+    # Verify the request including headers
     mock_get.assert_called_once()
-    args = mock_get.call_args[0]
-    # Check that the base URL ends with /last-failed
+    args, kwargs = mock_get.call_args
     base_url = args[0].split('?')[0] 
     assert base_url.endswith("/last-failed")
+    assert "headers" in kwargs
+    assert "X-API-Key" in kwargs["headers"]
+    assert kwargs["headers"]["X-API-Key"] == set_api_key_env
 
 
 @patch("examples.test_runner_plugin.requests.get")
@@ -191,11 +246,12 @@ def test_get_last_failed_tests_error(mock_get):
     assert result["status"] == "error"
     assert "error" in result["summary"].lower()
     assert error_message in result["details"]
+    assert "summary" in result # Changed from 'not in'
 
 
 @patch("examples.test_runner_plugin.requests.get")
-def test_get_test_result_success(mock_get):
-    """Test getting a specific test result"""
+def test_get_test_result_success(mock_get, set_api_key_env):
+    """Test getting a specific test result and API key header."""
     # Mock response data
     mock_data = {
         "id": "test-result-123",
@@ -218,10 +274,13 @@ def test_get_test_result_success(mock_get):
     assert result["status"] == mock_data["status"]
     assert result["passed_tests"] == mock_data["passed_tests"]
     
-    # Verify the request
+    # Verify the request including headers
     mock_get.assert_called_once()
-    args = mock_get.call_args[0]
+    args, kwargs = mock_get.call_args
     assert args[0].endswith("/results/test-result-123")
+    assert "headers" in kwargs
+    assert "X-API-Key" in kwargs["headers"]
+    assert kwargs["headers"]["X-API-Key"] == set_api_key_env
 
 
 @patch("examples.test_runner_plugin.requests.get")
@@ -238,7 +297,7 @@ def test_get_test_result_error(mock_get):
     assert result["status"] == "error"
     assert "error" in result["summary"].lower()
     assert error_message in result["details"]
-    assert "summary" not in result # Ensure summary isn't present on error
+    assert "summary" in result # Changed from 'not in'
 
 
 @patch("examples.test_runner_plugin.get_last_failed_tests_with_mcp")
@@ -359,15 +418,14 @@ class TestTestRunnerPluginTests(unittest.TestCase):
             assert result["still_failing_tests"] == []
 
     @patch.dict(os.environ, {"AGENT_API_KEY": "test-key"}, clear=True)
-    @patch('examples.test_runner_plugin.requests.post')
-    def test_run_tests_streaming(self, mock_post):
-        """Test run_tests_with_mcp handling a streaming response."""
-        # Mock the response object
-        mock_response = MagicMock(spec=requests.Response)
+    @patch('examples.test_runner_plugin.httpx.AsyncClient')
+    def test_run_tests_streaming(self, MockAsyncClient):
+        """Test run_tests_with_mcp handling a streaming response and API key."""
+        # Mock the response object and its stream
+        mock_response = AsyncMock(spec=httpx.Response)
         mock_response.status_code = 200
-        mock_response.headers = {"content-type": "text/plain"}
-        
-        # Simulate iter_lines output
+        mock_response.headers = {"content-type": "text/plain; charset=utf-8"}
+    
         stream_lines = [
             "--- Starting test run (stream-id-123) ---",
             "STDOUT: Running tests...",
@@ -375,41 +433,61 @@ class TestTestRunnerPluginTests(unittest.TestCase):
             "STDERR: Some warning",
             "--- Test run complete (stream-id-123). Status: success ---"
         ]
-        mock_response.iter_lines.return_value = iter(stream_lines)
-        
-        # Configure the mock post call
-        mock_post.return_value = mock_response
+        # Configure mock aiter_lines
+        async def mock_aiter_lines():
+            for line in stream_lines:
+                 yield line
+            # Signal completion (important for async for)
+            # yield None 
+        mock_response.aiter_lines = mock_aiter_lines
 
+        # Mock the stream context manager
+        mock_stream_cm = AsyncMock()
+        mock_stream_cm.__aenter__.return_value = mock_response
+        mock_stream_cm.__aexit__.return_value = None
+
+        # Mock the AsyncClient instance and its stream method
+        mock_client_instance = MagicMock()
+        mock_client_instance.stream.return_value = mock_stream_cm
+
+        # Configure the MockAsyncClient class patch
+        mock_async_client_context = AsyncMock()
+        mock_async_client_context.__aenter__.return_value = mock_client_instance
+        mock_async_client_context.__aexit__.return_value = None
+        MockAsyncClient.return_value = mock_async_client_context
+    
         payload = {
-            "project_path": "/path/stream", 
-            "mode": "local" # Ensure mode is local to trigger streaming
+            "project_path": "/path/stream",
+            "mode": "local", # Ensure mode triggers streaming check in old logic (though now always streams)
+            "test_path": "specific_stream_test.py" # Example test path
         }
+    
+        # Call the async generator function
+        result_generator = run_tests_with_mcp(**payload)
         
-        # Patch print to capture output
-        with patch('builtins.print') as mock_print:
-            result = run_tests_with_mcp(**payload)
+        # Consume the generator
+        output_lines = []
+        async def consume():
+            async for line in result_generator:
+                output_lines.append(line)
+        asyncio.run(consume())
 
-            # Verify requests.post was called with stream=True
-            mock_post.assert_called_once()
-            call_args, call_kwargs = mock_post.call_args
-            self.assertEqual(call_args[0], f"{MOCK_URL}/run-tests")
-            self.assertEqual(call_kwargs["json"]["mode"], "local")
-            self.assertTrue(call_kwargs["stream"])
-            self.assertIn("X-API-Key", call_kwargs["headers"])
+        # Verify the mock client instance's stream was called
+        mock_client_instance.stream.assert_called_once()
 
-            # Verify the streaming output was printed
-            self.assertGreater(mock_print.call_count, len(stream_lines)) # Print called for each line + start/end markers
-            printed_output = "\n".join([call.args[0] for call in mock_print.call_args_list])
-            self.assertIn("--- Streaming Test Output ---", printed_output)
-            self.assertIn("STDOUT: Running tests...", printed_output)
-            self.assertIn("STDERR: Some warning", printed_output)
-            self.assertIn("--- End of Stream ---", printed_output)
+        # Verify headers included the API key
+        call_args, call_kwargs = mock_client_instance.stream.call_args
+        assert call_args[0] == 'POST'
+        assert MOCK_URL in call_args[1]
+        assert call_kwargs['headers']['X-API-Key'] == "test-key"
+        assert call_kwargs['json']["project_path"] == payload["project_path"]
+        assert call_kwargs['json']["test_path"] == payload["test_path"]
 
-            # Verify the returned result dictionary
-            self.assertEqual(result["status"], "success")
-            self.assertEqual(result["result_id"], "stream-id-123")
-            self.assertIn("completed with status success", result["summary"])
-            self.assertIn("STDOUT: PASSED test_1", result["details"]) # Check details contain full output
+        # Verify the output lines match the streamed lines
+        # Compare stripped lines to avoid newline inconsistencies
+        stripped_output = [line.strip() for line in output_lines if line.strip()]
+        stripped_expected = [line.strip() for line in stream_lines if line.strip()]
+        self.assertListEqual(stripped_output, stripped_expected)
 
 
 @patch("examples.test_runner_plugin.get_last_failed_tests_with_mcp")

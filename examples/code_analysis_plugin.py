@@ -10,6 +10,7 @@ import json
 import requests
 from typing import Dict, Any, List, Optional
 import logging
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -38,6 +39,10 @@ except Exception as e:
 # Set up logging for the plugin
 logger = logging.getLogger(__name__)
 
+MAX_RETRIES = 3
+RETRY_WAIT_MULTIPLIER = 1
+RETRY_MAX_WAIT = 10
+
 def _get_headers() -> Dict[str, str]:
     """Returns headers for MCP requests, including API key if available."""
     headers = {"Content-Type": "application/json"}
@@ -46,9 +51,14 @@ def _get_headers() -> Dict[str, str]:
         headers["X-API-Key"] = api_key
     return headers
 
+@retry(
+    stop=stop_after_attempt(MAX_RETRIES),
+    wait=wait_exponential(multiplier=RETRY_WAIT_MULTIPLIER, max=RETRY_MAX_WAIT),
+    retry=retry_if_exception_type(requests.RequestException)
+)
 def analyze_code_with_mcp(code: str, language: str = "python") -> Dict[str, Any]:
     """
-    Analyze code using the MCP Code Server
+    Analyze code using the MCP Code Server (with retry)
     """
     mcp_url = os.environ.get("MCP_CODE_SERVER_URL", "http://localhost:8000") # Read env var inside
     url = f"{mcp_url}/analyze"
@@ -66,8 +76,18 @@ def analyze_code_with_mcp(code: str, language: str = "python") -> Dict[str, Any]
         logger.error(f"Connection error analyzing code at {url}: {e}")
         return {"success": False, "message": f"Connection error contacting Code MCP server at {url}", "details": str(e)}
     except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP error analyzing code at {url}: {e.response.status_code} - {e.response.text}")
-        return {"success": False, "message": f"HTTP error {e.response.status_code} from Code MCP server at {url}", "details": e.response.text}
+        status_code = e.response.status_code
+        error_text = e.response.text
+        logger.error(f"HTTP error analyzing code at {url}: {status_code} - {error_text}")
+        summary = f"HTTP error {status_code} from Code MCP server"
+        if status_code == 401:
+            summary = "Authentication error: Invalid API Key?"
+        elif status_code == 404:
+            summary = "Code MCP server endpoint not found"
+        elif status_code >= 500:
+            summary = "Code MCP server internal error"
+            
+        return {"success": False, "message": summary, "details": error_text}
     except requests.exceptions.RequestException as e:
         logger.error(f"Error analyzing code via MCP: {e}", exc_info=True)
         return {"success": False, "message": f"Error analyzing code: {e}", "details": str(e)}
@@ -94,9 +114,14 @@ def format_code_with_mcp(code: str, language: str = "python") -> Dict[str, Any]:
         }
 
 
+@retry(
+    stop=stop_after_attempt(MAX_RETRIES),
+    wait=wait_exponential(multiplier=RETRY_WAIT_MULTIPLIER, max=RETRY_MAX_WAIT),
+    retry=retry_if_exception_type(requests.RequestException)
+)
 def store_snippet_with_mcp(code: str, language: str = "python", snippet_id: Optional[str] = None) -> Dict[str, Any]:
     """
-    Store a code snippet in the MCP Code Server
+    Store a code snippet in the MCP Code Server (with retry)
     """
     if not snippet_id:
         import uuid
@@ -117,8 +142,18 @@ def store_snippet_with_mcp(code: str, language: str = "python", snippet_id: Opti
         logger.error(f"Connection error storing snippet at {url}: {e}")
         return {"success": False, "message": f"Connection error contacting Code MCP server at {url}", "details": str(e)}
     except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP error storing snippet at {url}: {e.response.status_code} - {e.response.text}")
-        return {"success": False, "message": f"HTTP error {e.response.status_code} from Code MCP server at {url}", "details": e.response.text}
+        status_code = e.response.status_code
+        error_text = e.response.text
+        logger.error(f"HTTP error storing snippet at {url}: {status_code} - {error_text}")
+        summary = f"HTTP error {status_code} from Code MCP server"
+        if status_code == 401:
+            summary = "Authentication error: Invalid API Key?"
+        elif status_code == 404:
+            summary = f"Code MCP server endpoint not found or snippet {snippet_id} invalid"
+        elif status_code >= 500:
+            summary = "Code MCP server internal error"
+            
+        return {"success": False, "message": summary, "details": error_text}
     except requests.exceptions.RequestException as e:
         logger.error(f"Error storing snippet via MCP: {e}", exc_info=True)
         return {"success": False, "message": f"Error storing snippet: {e}", "details": str(e)}

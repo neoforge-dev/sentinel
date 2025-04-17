@@ -1,7 +1,7 @@
 # BaseAgent MCP Development Makefile
 # Contains commonly used commands for development
 
-.PHONY: help setup test test-unit test-integration test-coverage test-file format lint run-code-server run-test-server run-agents clean
+.PHONY: help setup test test-unit test-integration test-coverage test-file format lint run-code-server run-test-server run-agents clean run-test-server-debug test-integration-debug test-integration-file docker-clean print-env stop-test-server
 
 # Default target executed when no arguments are given to make
 default: help
@@ -35,6 +35,12 @@ help:
 	@echo ""
 	@echo "Clean:"
 	@echo "  make clean           Remove build, test, coverage and Python artifacts"
+	@echo "  make run-test-server-debug   Run the test server with debug env vars in background (logs: test_server_debug.log)"
+	@echo "  make stop-test-server        Stop the background test server started by run-test-server-debug"
+	@echo "  make test-integration-debug  Run integration tests with debug logging (tee to docker_debug.log)"
+	@echo "  make test-integration-file FILE=...  Run a specific integration test file/pattern with debug logging"
+	@echo "  make print-env              Print relevant environment variables for debugging"
+	@echo "  make docker-clean           Remove all stopped Docker containers (optional)"
 
 # Setup commands
 setup:
@@ -93,6 +99,34 @@ run-integrated:
 	@echo "Running agent with both MCP integrations..."
 	python examples/register_mcps.py
 
+# Run test server with debug env vars in background (non-interactive, logs to test_server_debug.log)
+run-test-server-debug:
+	@echo "Starting MCP Test Runner Server with debug env vars (background, logs: test_server_debug.log)..."
+	MCP_API_KEY=dev_secret_key MCP_TEST_PORT=8082 nohup python -m agents.mcp_test_server > test_server_debug.log 2>&1 & echo $$! > test_server_debug.pid
+
+# Stop the background test server
+stop-test-server:
+	@echo "Stopping MCP Test Runner Server (if running)..."
+	@if [ -f test_server_debug.pid ]; then kill `cat test_server_debug.pid` && rm test_server_debug.pid && echo "Stopped."; else echo "No PID file found."; fi
+
+# Run integration tests with debug logging and capture output to docker_debug.log
+# Usage: make test-integration-debug
+test-integration-debug:
+	@echo "Running integration tests with debug logging (output: docker_debug.log)..."
+	python -m pytest tests/integration --log-cli-level=DEBUG | tee docker_debug.log
+
+# Run a specific integration test file or pattern
+# Usage: make test-integration-file FILE=tests/integration/test_test_server_integration.py -k docker
+test-integration-file:
+	@echo "Running integration test file/pattern: $(FILE)"
+	python -m pytest $(FILE) --log-cli-level=DEBUG
+
+# Print relevant environment variables for debugging
+print-env:
+	@echo "MCP_API_KEY=$${MCP_API_KEY}"
+	@echo "MCP_TEST_PORT=$${MCP_TEST_PORT}"
+	@echo "MCP_CODE_PORT=$${MCP_CODE_PORT}"
+
 # Clean command
 clean:
 	@echo "Cleaning project..."
@@ -107,4 +141,9 @@ clean:
 	find . -name "*.pyc" -delete
 	find . -name "*.pyo" -delete
 	find . -name "*.pyd" -delete
-	find . -name ".DS_Store" -delete 
+	find . -name ".DS_Store" -delete
+
+# Clean up all stopped Docker containers (optional, for test cleanup)
+docker-clean:
+	@echo "Removing all stopped Docker containers..."
+	docker container prune -f 

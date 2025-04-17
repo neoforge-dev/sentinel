@@ -19,7 +19,7 @@ Dependencies:
 import argparse
 import sys
 import os
-from typing import Dict, Any, Optional, List, Tuple, Union, Callable
+from typing import Dict, Any, Optional, List, Tuple, Union, Callable, Iterator
 import json
 import time
 import logging
@@ -215,8 +215,8 @@ class OllamaAgent:
         wait=wait_exponential(multiplier=RETRY_WAIT_MULTIPLIER, max=RETRY_MAX_WAIT),
         retry=retry_if_exception_type((requests.RequestException, ConnectionError))
     )
-    def generate(self, prompt: str, task_type: TaskType = TaskType.QUESTION_ANSWERING) -> str:
-        """Generate a response using Ollama with retry logic"""
+    def generate(self, prompt: str, task_type: TaskType = TaskType.QUESTION_ANSWERING) -> Iterator[str]:
+        """Generate a response using Ollama, yielding results incrementally (streaming)."""
         # Adjust settings based on task type
         settings = self.model_settings.copy()
         if task_type == TaskType.CODE_GENERATION:
@@ -225,35 +225,48 @@ class OllamaAgent:
             settings["temperature"] = 0.7  # Moderate temperature for planning
         
         try:
-            logger.debug(f"Sending request to Ollama ({self.model}, task: {task_type})")
+            logger.debug(f"Sending streaming request to Ollama ({self.model}, task: {task_type})")
             response = requests.post(
                 f"{self.ollama_url}/api/generate",
                 json={
                     "model": self.model,
                     "prompt": prompt,
-                    "stream": False,
+                    "stream": True,
                     "temperature": settings.get("temperature", 0.7),
                     "max_tokens": settings.get("max_tokens", 2048),
                     "top_p": settings.get("top_p", 0.9),
                     "system": settings.get("system_prompt", "")
                 },
-                timeout=60  # Longer timeout for larger models
+                timeout=60,
+                stream=True
             )
             
-            if response.status_code != 200:
-                error_detail = f"Status: {response.status_code}, Response: {response.text[:100]}..."
-                logger.error(f"Ollama API error: {error_detail}")
-                raise Exception(f"Ollama API error: {error_detail}")
-                
-            result = response.json()
-            return result.get("response", "")
+            # Check for initial connection errors (e.g., 404, 500 before stream starts)
+            response.raise_for_status() 
+
+            # Process the stream
+            full_response_for_error = ""
+            for line in response.iter_lines():
+                if line:
+                    decoded_line = line.decode('utf-8')
+                    full_response_for_error += decoded_line + '\n'
+                    try:
+                        chunk = json.loads(decoded_line)
+                        if "response" in chunk:
+                            yield chunk["response"]
+                        if chunk.get("done"):
+                            logger.debug("Ollama stream finished.")
+                            break
+                    except json.JSONDecodeError:
+                        logger.warning(f"Failed to decode JSON chunk: {decoded_line}")
             
-        except requests.RequestException as e:
-            logger.error(f"Request error: {str(e)}")
-            raise
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Ollama API request failed: {e}", exc_info=True)
+            yield f"[ERROR: Ollama request failed: {e}]"
         except Exception as e:
-            logger.error(f"Error generating response: {str(e)}")
-            return f"Error: {str(e)}"
+            logger.error(f"Unexpected error during Ollama generation: {e}", exc_info=True)
+            logger.error(f"Last received content before error: {full_response_for_error[-500:]}")
+            yield f"[ERROR: Unexpected error: {e}]"
     
     def get_context(self) -> Optional[Dict[str, Any]]:
         """Get context from MCP server if enabled"""
@@ -339,17 +352,25 @@ class OllamaAgent:
         
         try:
             response = self.generate(prompt, task_type=TaskType.PLANNING)
+            # The generate function NOW returns a generator. We need the full response.
+            full_response = "".join(list(response))
+
             # Parse the response to extract steps
             steps = []
-            for line in response.split("\n"):
+            # Process the accumulated full_response string
+            for line in full_response.split("\n"):
                 line = line.strip()
                 # Match numbered items with format "1. Step description"
-                if re.match(r"^\d+\.?\s+", line):
-                    steps.append(re.sub(r"^\d+\.?\s+", "", line))
+                match = re.match(r"^\s*\d+[\.\)]\s*(.*)", line)
+                if match:
+                    steps.append(match.group(1).strip())
+                elif line and not line.lower().startswith("here is a plan") and not line.lower().startswith("plan:"):
+                    # Add lines that aren't just headers
+                    steps.append(line)
             
             if not steps:
                 # Fallback if parsing fails
-                steps = [s.strip() for s in response.split("\n") if s.strip()]
+                steps = [s.strip() for s in full_response.split("\n") if s.strip()]
             
             self.context.task_plan = steps
             return steps
@@ -589,23 +610,45 @@ class OllamaAgent:
                         print(f"{i}. {step}")
                     continue
                 elif user_input.lower().startswith("!code "):
-                    # Generate code
-                    desc = user_input[6:].strip()
-                    print(f"{colorama.Fore.YELLOW}Generating code for: {desc}{colorama.Style.RESET_ALL}")
+                    # Handle !code command
+                    parts = user_input.split(" ", 1)
+                    if len(parts) < 2 or not parts[1].strip():
+                        print(colorama.Fore.YELLOW + "Usage: !code <description>" + colorama.Style.RESET_ALL)
+                        continue
                     
-                    # Get language if specified with format "!code python: description"
-                    language = "python"
-                    if ":" in desc:
-                        language, desc = desc.split(":", 1)
-                        language = language.strip().lower()
-                        desc = desc.strip()
+                    code_description = parts[1].strip()
+                    # Optional language specification: !code python: <desc>
+                    language = "python" # Default
+                    if ":" in code_description:
+                         lang_part, desc_part = code_description.split(":", 1)
+                         # Basic check if lang_part looks like a language identifier
+                         if len(lang_part) < 15 and not ' ' in lang_part.strip(): 
+                              language = lang_part.strip()
+                              code_description = desc_part.strip()
                     
-                    code = self.generate_code(desc, language)
+                    print(colorama.Fore.YELLOW + f"Generating code for: {code_description} ({language})" + colorama.Style.RESET_ALL)
+                    code_prompt = f"Generate {language} code for the following description: {code_description}"
                     
-                    print(f"\n{colorama.Fore.GREEN}💻 Generated Code:{colorama.Style.RESET_ALL}")
+                    # --- FIX: Consume the generator --- 
+                    generated_code_generator = self.generate(prompt=code_prompt, task_type=TaskType.CODE_GENERATION)
+                    generated_code_parts = []
+                    print(colorama.Fore.CYAN + "💻 Generated Code:")
                     print(f"```{language}")
-                    print(code)
-                    print("```")
+                    try:
+                        for chunk in generated_code_generator:
+                             print(chunk, end='', flush=True) # Print chunk as it arrives
+                             generated_code_parts.append(chunk)
+                        print() # Print newline after stream ends
+                    except Exception as e:
+                        print(f"\nError during code generation stream: {e}")
+                    
+                    full_generated_code = "".join(generated_code_parts)
+                    print("```" + colorama.Style.RESET_ALL)
+                    # --- End Fix --- 
+
+                    # Add generated code to context or handle as needed
+                    # self.context.resources['last_generated_code'] = MCPResource(id="last_gen_code", content=full_generated_code, metadata={'language': language})
+
                     continue
                 elif user_input.lower().startswith("!tool "):
                     # Execute a tool
@@ -660,20 +703,18 @@ class OllamaAgent:
                 
                 print(f"\n{colorama.Fore.GREEN}🤖 Agent: {colorama.Style.RESET_ALL}", end="", flush=True)
                 
-                # Process with progress indicator for long responses
-                with tqdm(total=100, desc="💭Thinking", bar_format="{desc}: {bar}| {percentage:3.0f}%") as pbar:
-                    response = self.generate(prompt)
-                    # Simulate progress for UX
-                    for _ in range(4):
-                        time.sleep(0.1)
-                        pbar.update(25)
-                
-                print(response)
-                
-                # Add to conversation history
+                # Removed tqdm progress bar
+                # Process the streaming response
+                full_response = ""
+                for chunk in self.generate(prompt):
+                    print(chunk, end="", flush=True) # Print each chunk as it arrives
+                    full_response += chunk
+                print() # Add a newline after the stream finishes
+
+                # Add full response to conversation history
                 self.context.conversation_history.append({
                     "role": "assistant",
-                    "content": response
+                    "content": full_response # Store accumulated response
                 })
                 
                 # Update MCP with conversation if enabled
@@ -683,7 +724,7 @@ class OllamaAgent:
                             f"{self.mcp_url}/context/conversation",
                             json={
                                 "role": "assistant",
-                                "content": response,
+                                "content": full_response, # Send accumulated response
                                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                             }
                         )

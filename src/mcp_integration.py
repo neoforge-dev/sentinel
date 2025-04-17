@@ -12,6 +12,14 @@ import asyncio
 import aiohttp
 from typing import Dict, List, Any, Optional, Union
 
+# --- Default URLs (Consider moving to a config file) ---
+DEFAULT_MCP_CODE_SERVER_URL = os.environ.get(
+    "MCP_CODE_SERVER_URL", "http://localhost:8081"
+)
+DEFAULT_MCP_TEST_SERVER_URL = os.environ.get(
+    "MCP_TEST_SERVER_URL", "http://localhost:8082"
+)
+
 class MCPIntegration:
     """Integration class for MCP servers."""
     
@@ -27,12 +35,8 @@ class MCPIntegration:
             code_server_url: URL of the MCP code server
             test_server_url: URL of the MCP test server
         """
-        self.code_server_url = code_server_url or os.environ.get(
-            "MCP_CODE_SERVER_URL", "http://localhost:8000"
-        )
-        self.test_server_url = test_server_url or os.environ.get(
-            "MCP_TEST_SERVER_URL", "http://localhost:8001"
-        )
+        self.code_server_url = code_server_url or DEFAULT_MCP_CODE_SERVER_URL
+        self.test_server_url = test_server_url or DEFAULT_MCP_TEST_SERVER_URL
         self.session = None
     
     async def __aenter__(self):

@@ -13,6 +13,7 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional, Union
 import aiohttp
+from collections.abc import Callable
 
 # Configure logging
 logging.basicConfig(
@@ -32,130 +33,95 @@ class MCPEnhancedAgent:
     def __init__(
         self,
         code_server_url: str = "http://localhost:8000",
-        test_server_url: str = "http://localhost:8001",
+        test_server_url: str = "http://localhost:8082",
+        api_key: Optional[str] = None,
+        session: Optional[aiohttp.ClientSession] = None
     ):
-        """
-        Initialize the MCP Enhanced Agent.
-        
-        Args:
-            code_server_url: URL of the MCP Code Server
-            test_server_url: URL of the MCP Test Server
-        """
+        """Initialize the agent with server URLs and optional session."""
         self.code_server_url = code_server_url
         self.test_server_url = test_server_url
-        self.session = None
-        logger.info(f"Initialized MCPEnhancedAgent with code server at {code_server_url} "
-                   f"and test server at {test_server_url}")
-    
-    async def __aenter__(self):
-        """Set up the aiohttp session for the context manager."""
-        if not self.session:
+        self.api_key = api_key
+        self.default_headers = {'Content-Type': 'application/json'} # Initialize default headers
+        
+        if session:
+            self.session = session
+            self._owns_session = False
+            logger.info("Using provided aiohttp ClientSession.")
+        else:
+            # Create a default session if none is provided
             self.session = aiohttp.ClientSession()
-        return self
+            self._owns_session = True
+            logger.info("Created internal aiohttp ClientSession.")
+            
+        logger.info(f"Initialized MCPEnhancedAgent with code server at {self.code_server_url} and test server at {self.test_server_url}")
     
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Clean up the aiohttp session."""
-        if self.session:
+    async def close(self):
+        """Closes the internally managed session, if it exists and is owned by the agent."""
+        if self.session and self._owns_session:
             await self.session.close()
             self.session = None
+            self._owns_session = False
+            logger.info("Closed internally owned aiohttp ClientSession.")
+        elif not self._owns_session:
+            logger.debug("Agent does not own the session, not closing it.")
+        else:
+            logger.debug("No active session to close.")
     
-    async def _ensure_session(self):
-        """Ensure an aiohttp session exists."""
-        if not self.session:
-            self.session = aiohttp.ClientSession()
-    
-    async def _make_request(
-        self, 
-        method: str, 
-        url: str, 
-        data: Optional[Dict[str, Any]] = None,
-        headers: Optional[Dict[str, str]] = None
-    ) -> Dict[str, Any]:
-        """
-        Make an HTTP request to an MCP server.
+    async def _make_request(self, method: str, url: str, **kwargs) -> Dict[str, Any]:
+        """Makes an async HTTP request and handles common responses."""
+        headers = self.default_headers.copy()
+        if self.api_key:
+            headers['X-API-Key'] = self.api_key
         
-        Args:
-            method: HTTP method (GET, POST, etc.)
-            url: Full URL for the request
-            data: Optional JSON data for POST requests
-            headers: Optional HTTP headers
-            
-        Returns:
-            Dictionary containing the response data
-        """
-        await self._ensure_session()
-        
-        default_headers = {'Content-Type': 'application/json'}
-        if headers:
-            default_headers.update(headers)
+        request_kwargs = {"headers": headers, **kwargs}
         
         try:
-            if method.upper() == 'GET':
-                async with self.session.get(url, headers=default_headers) as response:
-                    response.raise_for_status()
-                    return await response.json()
-            elif method.upper() == 'POST':
-                async with self.session.post(url, json=data, headers=default_headers) as response:
-                    response.raise_for_status()
-                    return await response.json()
-            else:
-                raise ValueError(f"Unsupported HTTP method: {method}")
+            async with self.session.request(method, url, **request_kwargs) as response:
+                # Try to parse JSON regardless of status code initially
+                try:
+                    json_data = await response.json()
+                except (aiohttp.ContentTypeError, json.JSONDecodeError):
+                    # If JSON parsing fails, read text and store it
+                    text_data = await response.text()
+                    json_data = {"error": "Failed to decode JSON", "status_code": response.status, "text": text_data}
+
+                # Combine status code with JSON data (or error data)
+                result_data = {"status_code": response.status, **json_data}
+                
+                # Log non-2xx responses
+                if not 200 <= response.status < 300:
+                    logger.error(f"HTTP error: {response.status} {response.reason} for {method} {url}. Response: {result_data}")
+                    # Optionally raise an exception here for critical errors, 
+                    # but for now, returning the data allows calling methods to decide.
+
+                return result_data
         except aiohttp.ClientError as e:
-            logger.error(f"HTTP error when making {method} request to {url}: {str(e)}")
-            return {"error": str(e), "status": "error"}
-        except json.JSONDecodeError:
-            logger.error(f"Invalid JSON response from {url}")
-            return {"error": "Invalid JSON response", "status": "error"}
+            logger.error(f"HTTP client error when making {method} request to {url}: {e}")
+            return {"status_code": 503, "error": f"HTTP client error: {e}"} # 503 Service Unavailable
         except Exception as e:
-            logger.error(f"Unexpected error with {method} request to {url}: {str(e)}")
-            return {"error": str(e), "status": "error"}
+            logger.error(f"Unexpected error during {method} request to {url}: {e}", exc_info=True)
+            return {"status_code": 500, "error": f"Unexpected agent error: {e}"}
     
     # Code Server Methods
     
     async def analyze_code(self, code: str, language: str = "python") -> Dict[str, Any]:
-        """
-        Analyze code for issues using the MCP Code Server.
-        
-        Args:
-            code: The code to analyze
-            language: Programming language of the code (default: python)
-            
-        Returns:
-            Dictionary with analysis results including issues and recommendations
-        """
+        """Analyzes code using the code server."""
         url = f"{self.code_server_url}/analyze"
-        data = {"code": code, "language": language}
-        return await self._make_request("POST", url, data)
+        payload = {"code": code, "language": language}
+        # _make_request now includes status_code and potential error fields
+        return await self._make_request("POST", url, json=payload)
     
     async def format_code(self, code: str, language: str = "python") -> Dict[str, Any]:
-        """
-        Format code according to language-specific guidelines.
-        
-        Args:
-            code: The code to format
-            language: Programming language of the code (default: python)
-            
-        Returns:
-            Dictionary with the formatted code
-        """
+        """Formats code using the code server."""
         url = f"{self.code_server_url}/format"
-        data = {"code": code, "language": language}
-        return await self._make_request("POST", url, data)
+        payload = {"code": code, "language": language}
+        return await self._make_request("POST", url, json=payload)
     
     async def analyze_and_fix_code(self, code: str, language: str = "python") -> Dict[str, Any]:
-        """
-        Analyze code, attempt to automatically fix issues, and return the results.
-        
-        Args:
-            code: The code to analyze and fix
-            language: Programming language of the code (default: python)
-            
-        Returns:
-            Dictionary containing the fixed code, remaining issues, and applied fixes.
-        """
+        """Fixes code using the code server."""
         url = f"{self.code_server_url}/fix"
-        data = {"code": code, "language": language}
-        return await self._make_request("POST", url, data)
+        payload = {"code": code, "language": language}
+        return await self._make_request("POST", url, json=payload)
     
     async def store_code_snippet(
         self, 
@@ -163,37 +129,14 @@ class MCPEnhancedAgent:
         language: str = "python", 
         metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
-        """
-        Store a code snippet for later retrieval.
-        
-        Args:
-            code: The code snippet to store
-            language: Programming language of the code (default: python)
-            metadata: Optional metadata to associate with the snippet
-            
-        Returns:
-            Dictionary with the snippet ID
-        """
-        url = f"{self.code_server_url}/store"
-        data = {
-            "code": code,
-            "language": language
-        }
-        if metadata:
-            data["metadata"] = metadata
-        return await self._make_request("POST", url, data)
+        """Stores a code snippet via the code server."""
+        url = f"{self.code_server_url}/snippets" # Corrected endpoint
+        payload = {"code": code, "language": language, "metadata": metadata or {}}
+        return await self._make_request("POST", url, json=payload)
     
     async def get_code_snippet(self, snippet_id: str) -> Dict[str, Any]:
-        """
-        Retrieve a stored code snippet.
-        
-        Args:
-            snippet_id: ID of the snippet to retrieve
-            
-        Returns:
-            Dictionary with the code snippet and metadata
-        """
-        url = f"{self.code_server_url}/snippet/{snippet_id}"
+        """Retrieves a code snippet from the code server."""
+        url = f"{self.code_server_url}/snippets/{snippet_id}" # Corrected endpoint
         return await self._make_request("GET", url)
     
     # Test Server Methods
@@ -201,7 +144,7 @@ class MCPEnhancedAgent:
     async def run_tests(
         self,
         project_path: str,
-        test_path: Optional[str] = None,
+        test_path: str = ".",
         runner: str = "pytest",
         mode: str = "local",
         max_failures: Optional[int] = None,
@@ -211,45 +154,27 @@ class MCPEnhancedAgent:
         docker_image: Optional[str] = None,
         additional_args: Optional[List[str]] = None
     ) -> Dict[str, Any]:
-        """
-        Run tests in a local Python project.
-        
-        Args:
-            project_path: Path to the project root
-            test_path: Path to tests (relative to project_path)
-            runner: Test runner to use (pytest, unittest, uv)
-            mode: Execution mode (local, docker)
-            max_failures: Stop after this many failures
-            run_last_failed: Only run tests that failed in the last run
-            timeout: Maximum execution time in seconds
-            max_tokens: Maximum tokens for output
-            docker_image: Docker image to use if mode is 'docker'
-            additional_args: Additional arguments to pass to the test runner
-            
-        Returns:
-            Dictionary with test results
-        """
-        url = f"{self.test_server_url}/run"
-        data = {
+        """Runs tests using the test server."""
+        url = f"{self.test_server_url}/run-tests"
+        payload = {
             "project_path": project_path,
+            "test_path": test_path,
             "runner": runner,
             "mode": mode,
             "timeout": timeout,
             "max_tokens": max_tokens
         }
         
-        if test_path:
-            data["test_path"] = test_path
         if max_failures is not None:
-            data["max_failures"] = max_failures
+            payload["max_failures"] = max_failures
         if run_last_failed:
-            data["run_last_failed"] = run_last_failed
+            payload["run_last_failed"] = run_last_failed
         if docker_image:
-            data["docker_image"] = docker_image
+            payload["docker_image"] = docker_image
         if additional_args:
-            data["additional_args"] = additional_args
+            payload["additional_args"] = additional_args
             
-        return await self._make_request("POST", url, data)
+        return await self._make_request("POST", url, json=payload)
     
     async def run_and_analyze_tests(
         self,
@@ -358,6 +283,53 @@ class MCPEnhancedAgent:
         url = f"{self.test_server_url}/failed"
         response = await self._make_request("GET", url)
         return response.get("failed_tests", [])
+
+    # --- Tool Management --- 
+    def register_tool(self, name: str, function: Callable):
+        """Register an external function as a tool."""
+        if not callable(function):
+             raise TypeError(f"Tool function '{name}' must be callable.")
+        if name in self.tools:
+             logger.warning(f"Overwriting existing tool: {name}")
+        self.tools[name] = function
+        logger.info(f"Registered tool: {name}")
+
+    async def execute_tool(self, tool_name: str, **kwargs) -> Dict[str, Any]:
+        """
+        Execute a registered tool by name.
+        
+        Args:
+            tool_name: The name of the tool to execute.
+            **kwargs: Arguments to pass to the tool function.
+            
+        Returns:
+            Dictionary containing the tool's execution result or an error.
+        """
+        if tool_name not in self.tools:
+            logger.error(f"Tool not found: {tool_name}")
+            return {"success": False, "error": f"Tool '{tool_name}' not found."}
+        
+        tool_func = self.tools[tool_name]
+        try:
+            # Check if the function is async
+            if asyncio.iscoroutinefunction(tool_func):
+                result = await tool_func(**kwargs)
+            else:
+                # Run synchronous function in thread pool executor if available?
+                # For simplicity now, run directly (might block event loop!)
+                # Consider using asyncio.to_thread in Python 3.9+
+                result = tool_func(**kwargs)
+                
+            # Assume tool functions return a dictionary or serializable result
+            # If they return simple types, wrap them
+            if not isinstance(result, dict):
+                 result = {"result": result}
+                 
+            return {"success": True, "tool_name": tool_name, "result": result}
+        
+        except Exception as e:
+            logger.error(f"Error executing tool '{tool_name}': {e}", exc_info=True)
+            return {"success": False, "tool_name": tool_name, "error": str(e)}
 
 
 if __name__ == "__main__":

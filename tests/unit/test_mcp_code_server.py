@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 from agents.mcp_code_server import app
 
 # Directly import database components - assume they exist when testing
-from src.storage.database import DatabaseManager, get_db_manager
+from src.storage.database import DatabaseManager, get_request_db_manager
 
 # Import security dependency
 try:
@@ -57,15 +57,21 @@ def mock_db_manager():
     # Add mocks for other DB methods used by the code server if any
     return mock
 
-# Override the get_db_manager dependency for all tests in this module
+# Override the get_request_db_manager dependency for all tests in this module
 @pytest.fixture(autouse=True)
-def override_get_db_manager(mock_db_manager):
-    async def _override_get_db():
+def override_get_db_dependency(mock_db_manager):
+    """Overrides the get_request_db_manager dependency for all tests in this module."""
+    async def _override_get_db(): 
+        # Return the mock directly, as get_request_db_manager is not a generator dependency in this context
+        # If it were yielding, the override would also need to yield.
+        # However, the Depends() mechanism handles the async generator correctly.
+        # We just need to provide the mock instance when the dependency is called.
         return mock_db_manager
     
     # Store original overrides if any
     original_overrides = app.dependency_overrides.copy()
-    app.dependency_overrides[get_db_manager] = _override_get_db
+    # Override the correct dependency function
+    app.dependency_overrides[get_request_db_manager] = _override_get_db
     yield
     # Restore original overrides
     app.dependency_overrides = original_overrides
@@ -174,13 +180,9 @@ def add(a,b)
     assert response.status_code == 400
     result = response.json()
 
-    # Check for the specific error structure
-    assert "error" in result
-    assert result["error"] == "Formatting failed"
-    assert "details" in result
-    assert "formatted_code" in result
-    # Ensure original code is returned in the error response
-    assert result["formatted_code"] == test_code
+    # Check for the specific error structure (FastAPI uses 'detail')
+    assert "detail" in result 
+    assert "Ruff format failed" in result["detail"] # Check detail content
 
 
 @pytest.mark.asyncio

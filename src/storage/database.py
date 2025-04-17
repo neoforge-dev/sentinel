@@ -19,7 +19,8 @@ import logging
 import os
 from pathlib import Path
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, AsyncGenerator
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -35,16 +36,26 @@ DB_PATH = os.environ.get("MCP_DB_PATH", DEFAULT_DB_PATH)
 # Ensure the data directory exists
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
-# Singleton database manager instance
+# Singleton database manager instance (RETAINED, but not used for request dependency)
 _db_manager = None
 
 
 def get_db_manager() -> 'DatabaseManager':
-    """Get the singleton database manager instance."""
+    """Get the singleton database manager instance (for non-request scope use if needed)."""
     global _db_manager
     if _db_manager is None:
         _db_manager = DatabaseManager(DB_PATH)
     return _db_manager
+
+# NEW: Request-scoped dependency
+async def get_request_db_manager() -> AsyncGenerator['DatabaseManager', None]:
+    """FastAPI dependency that provides a DB manager connected for a single request."""
+    db = DatabaseManager(DB_PATH) # Create instance for this request
+    try:
+        await db.connect()
+        yield db
+    finally:
+        await db.disconnect()
 
 
 class DatabaseManager:
@@ -88,88 +99,97 @@ class DatabaseManager:
             self.conn = None
     
     async def _create_tables(self) -> None:
-        """Create all necessary tables if they don't exist."""
+        """Create database tables if they don't exist."""
         if not self.conn:
             await self.connect()
         
-        logger.info("Creating database tables if they don't exist")
+        create_statements = [
+            """
+            CREATE TABLE IF NOT EXISTS test_results (
+                id TEXT PRIMARY KEY,
+                status TEXT,
+                summary TEXT,
+                details TEXT,
+                passed_tests TEXT,
+                failed_tests TEXT,
+                skipped_tests TEXT,
+                execution_time REAL,
+                config TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS last_failed_tests (
+                test_name TEXT,
+                project_path TEXT,
+                timestamp REAL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS code_snippets (
+                id TEXT PRIMARY KEY,
+                code TEXT,
+                language TEXT,
+                timestamp REAL,
+                metadata TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS code_analysis (
+                id TEXT PRIMARY KEY,
+                code_id TEXT,
+                timestamp REAL,
+                issues TEXT,
+                formatted_code TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS code_fixes (
+                id TEXT PRIMARY KEY,
+                original_code TEXT,
+                language TEXT,
+                fixed_code TEXT,
+                issues_remaining TEXT,
+                applied_fixes TEXT,
+                timestamp REAL,
+                original_code_id TEXT
+            )
+            """
+        ]
         
-        # Test Results table
-        await self.conn.execute("""
-        CREATE TABLE IF NOT EXISTS test_results (
-            id TEXT PRIMARY KEY,
-            status TEXT NOT NULL,
-            summary TEXT NOT NULL,
-            details TEXT NOT NULL,
-            passed_tests TEXT NOT NULL,
-            failed_tests TEXT NOT NULL,
-            skipped_tests TEXT NOT NULL,
-            execution_time REAL NOT NULL,
-            config TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """)
+        indexes = [
+            "CREATE INDEX IF NOT EXISTS idx_test_results_status ON test_results(status)",
+            "CREATE INDEX IF NOT EXISTS idx_last_failed_tests_timestamp ON last_failed_tests(timestamp)",
+            "CREATE INDEX IF NOT EXISTS idx_last_failed_tests_project_path ON last_failed_tests(project_path)"
+        ]
         
-        # Test Details table
-        await self.conn.execute("""
-        CREATE TABLE IF NOT EXISTS test_details (
-            id TEXT PRIMARY KEY,
-            test_result_id TEXT NOT NULL,
-            test_type TEXT NOT NULL,
-            test_name TEXT NOT NULL,
-            details TEXT,
-            FOREIGN KEY (test_result_id) REFERENCES test_results(id) ON DELETE CASCADE
-        )
-        """)
+        # Check if project_path column exists in last_failed_tests table
+        try:
+            async with self.conn.execute("PRAGMA table_info(last_failed_tests)") as cursor:
+                columns = await cursor.fetchall()
+                has_project_path = any(column[1] == 'project_path' for column in columns)
+                
+                # Add project_path column if it doesn't exist
+                if not has_project_path:
+                    await self.conn.execute("ALTER TABLE last_failed_tests ADD COLUMN project_path TEXT")
+                    logger.info("Added project_path column to last_failed_tests table")
+        except Exception as e:
+            logger.error(f"Error checking last_failed_tests schema: {e}")
         
-        # Last Failed Tests table
-        await self.conn.execute("""
-        CREATE TABLE IF NOT EXISTS last_failed_tests (
-            test_name TEXT PRIMARY KEY,
-            timestamp REAL NOT NULL
-        )
-        """)
-        
-        # Code Snippets table
-        await self.conn.execute("""
-        CREATE TABLE IF NOT EXISTS code_snippets (
-            id TEXT PRIMARY KEY,
-            code TEXT NOT NULL,
-            language TEXT NOT NULL,
-            timestamp REAL NOT NULL,
-            metadata TEXT
-        )
-        """)
-        
-        # Code Analysis table
-        await self.conn.execute("""
-        CREATE TABLE IF NOT EXISTS code_analysis (
-            id TEXT PRIMARY KEY,
-            code_id TEXT, -- Made optional, removed NOT NULL
-            timestamp REAL NOT NULL,
-            issues TEXT,
-            formatted_code TEXT,
-            FOREIGN KEY (code_id) REFERENCES code_snippets(id) ON DELETE CASCADE
-        )
-        """)
-        
-        # Code Fixes table
-        await self.conn.execute("""
-        CREATE TABLE IF NOT EXISTS code_fixes (
-            id TEXT PRIMARY KEY,
-            original_code_id TEXT, -- Can be NULL if not linked to a snippet
-            timestamp REAL NOT NULL,
-            language TEXT NOT NULL,
-            original_code TEXT NOT NULL,
-            fixed_code TEXT NOT NULL,
-            issues_remaining TEXT, -- JSON list of remaining issues
-            applied_fixes TEXT, -- JSON list of applied fixes
-            FOREIGN KEY (original_code_id) REFERENCES code_snippets(id) ON DELETE SET NULL
-        )
-        """)
-        
-        await self.conn.commit()
-        logger.info("Database tables created successfully")
+        try:
+            # Execute create statements
+            for statement in create_statements:
+                await self.conn.execute(statement)
+            
+            # Create indexes
+            for index in indexes:
+                await self.conn.execute(index)
+                
+            await self.conn.commit()
+            logger.info("Database tables created successfully")
+        except Exception as e:
+            logger.error(f"Error creating database tables: {e}")
+            raise
     
     # Test Results Methods
     
@@ -185,34 +205,77 @@ class DatabaseManager:
         execution_time: float,
         config: dict
     ) -> None:
-        """Store a test execution result in the database."""
+        """
+        Store a test execution result in the database.
+        
+        Args:
+            result_id: Unique identifier for the result
+            status: Status of the test run (success, failed, error)
+            summary: Summary of the test run
+            details: Detailed output of the test run
+            passed_tests: List of tests that passed
+            failed_tests: List of tests that failed
+            skipped_tests: List of tests that were skipped
+            execution_time: Time taken to execute the tests
+            config: Configuration used for the test run
+        """
         if not self.conn:
             await self.connect()
         
-        # Ensure all list fields are properly serialized
+        # Convert lists to JSON strings
         passed_tests_json = json.dumps(passed_tests)
         failed_tests_json = json.dumps(failed_tests)
         skipped_tests_json = json.dumps(skipped_tests)
         config_json = json.dumps(config)
         
+        # Insert test result
         await self.conn.execute(
             """
             INSERT INTO test_results (
                 id, status, summary, details, 
-                passed_tests, failed_tests, skipped_tests,
+                passed_tests, failed_tests, skipped_tests, 
                 execution_time, config
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 result_id, status, summary, details,
-                passed_tests_json,
-                failed_tests_json,
-                skipped_tests_json,
-                execution_time,
-                config_json
+                passed_tests_json, failed_tests_json, skipped_tests_json,
+                execution_time, config_json
             )
         )
+        
+        # Get project path from config for storing with failed tests
+        project_path = None
+        if isinstance(config, dict):
+            project_path = config.get('project_path')
+        
+        # If tests failed, store them in the last_failed_tests table with project_path
+        if status == "failed" and failed_tests:
+            # Clear existing failed tests for this project if provided
+            if project_path:
+                await self.conn.execute(
+                    "DELETE FROM last_failed_tests WHERE project_path = ?",
+                    (project_path,)
+                )
+            
+            # Insert new failed tests
+            current_time = time.time()
+            for test in failed_tests:
+                await self.conn.execute(
+                    "INSERT INTO last_failed_tests (test_name, project_path, timestamp) VALUES (?, ?, ?)",
+                    (test, project_path, current_time)
+                )
+            logger.info(f"Stored {len(failed_tests)} failed tests for result {result_id}")
+        
+        # Clear failed tests if status is success and project_path is provided
+        elif status == "success" and project_path:
+            await self.conn.execute(
+                "DELETE FROM last_failed_tests WHERE project_path = ?", 
+                (project_path,)
+            )
+            logger.info(f"Clearing last_failed_tests for successful run {result_id}")
+        
         await self.conn.commit()
         logger.info(f"Stored test result with ID: {result_id}")
 
@@ -235,12 +298,46 @@ class DatabaseManager:
             result = dict(zip(columns, row))
             
             # Deserialize JSON fields
-            result["passed_tests"] = json.loads(result["passed_tests"])
-            result["failed_tests"] = json.loads(result["failed_tests"])
-            result["skipped_tests"] = json.loads(result["skipped_tests"])
-            result["config"] = json.loads(result["config"])
-            
-            logger.info(f"Retrieved test result with ID: {result_id}")
+            try:
+                result["passed_tests"] = json.loads(result.get("passed_tests", "[]"))
+                result["failed_tests"] = json.loads(result.get("failed_tests", "[]"))
+                result["skipped_tests"] = json.loads(result.get("skipped_tests", "[]"))
+                config_data = json.loads(result.get("config", "{}"))
+                result["config"] = config_data
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to deserialize JSON for result {result_id}: {e}")
+                # Assign default empty dict if deserialization fails
+                result["config"] = {}
+                config_data = {}
+
+            # Extract fields from config to match TestResult model
+            result["project_path"] = config_data.get("project_path")
+            result["test_path"] = config_data.get("test_path")
+            result["runner"] = config_data.get("runner")
+            result["execution_mode"] = config_data.get("mode") # Map 'mode' from config to 'execution_mode'
+
+            # Convert created_at to datetime object if it's a string
+            created_at_val = result.get("created_at")
+            if isinstance(created_at_val, str):
+                try:
+                    # Attempt parsing common ISO formats
+                    result["created_at"] = datetime.fromisoformat(created_at_val.replace("Z", "+00:00"))
+                except ValueError:
+                     try:
+                         # Fallback for other potential formats (e.g., space separator)
+                         result["created_at"] = datetime.strptime(created_at_val, "%Y-%m-%d %H:%M:%S.%f")
+                     except ValueError:
+                          logger.warning(f"Could not parse created_at timestamp: {created_at_val}")
+                          # Keep original or set to None/default? Let Pydantic handle for now.
+                          pass 
+            elif isinstance(created_at_val, (int, float)):
+                # Handle potential Unix timestamps
+                result["created_at"] = datetime.fromtimestamp(created_at_val)
+                
+            # Remove the original config blob as it's not in TestResult model
+            # result.pop("config", None) # Keep the config field for direct DB access tests
+
+            logger.info(f"Retrieved and processed test result with ID: {result_id}")
             return result
     
     async def list_test_results(self, limit: int = 10) -> List[Dict[str, Any]]:
@@ -287,10 +384,13 @@ class DatabaseManager:
                 result_list.append(result_dict)
             return result_list
     
-    async def get_last_failed_tests(self) -> List[str]:
+    async def get_last_failed_tests(self, project_path: Optional[str] = None) -> List[str]:
         """
         Get the list of tests that failed in the most recent run.
         
+        Args:
+            project_path: Optional path to filter test results by project
+
         Returns:
             A list of test names that failed
         """
@@ -298,11 +398,22 @@ class DatabaseManager:
             await self.connect()
         
         failed_tests = []
-        async with self.conn.execute(
-            "SELECT test_name FROM last_failed_tests ORDER BY timestamp DESC"
-        ) as cursor:
-            rows = await cursor.fetchall()
-            failed_tests = [row[0] for row in rows]
+        
+        if project_path:
+            # Filter by project path if provided
+            async with self.conn.execute(
+                "SELECT test_name FROM last_failed_tests WHERE project_path = ? ORDER BY timestamp DESC",
+                (project_path,)
+            ) as cursor:
+                rows = await cursor.fetchall()
+                failed_tests = [row[0] for row in rows]
+        else:
+            # Get all failed tests if no project path filter
+            async with self.conn.execute(
+                "SELECT test_name FROM last_failed_tests ORDER BY timestamp DESC"
+            ) as cursor:
+                rows = await cursor.fetchall()
+                failed_tests = [row[0] for row in rows]
         
         return failed_tests
     

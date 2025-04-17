@@ -1,0 +1,35 @@
+# Use an official Python runtime as a parent image
+FROM python:3.11-slim
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE 1
+ENV PYTHONUNBUFFERED 1
+# Set API Key (can be overridden at runtime)
+ENV MCP_API_KEY=dev_secret_key 
+ENV MCP_TEST_PORT=8082
+
+# Set the working directory in the container
+WORKDIR /app
+
+# Install uv globally from bootstrap script
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    ln -s /root/.cargo/bin/uv /usr/local/bin/uv
+
+# Copy the requirements file into the container at /app
+COPY requirements.txt .
+
+# Install any needed packages specified in requirements.txt using uv
+# Use --system to install into the global site-packages, typical for containers
+# Ensure docker, pytest, nose2 etc. are in requirements
+RUN uv pip install --system -r requirements.txt
+
+# Copy the rest of the application code into the container at /app
+# Adjust source path if needed based on context
+COPY agents/mcp_test_server.py .
+COPY src/ /app/src
+
+# Make port 8082 available to the world outside this container
+EXPOSE 8082
+
+# Define the command to run your app using uvicorn
+CMD ["uvicorn", "mcp_test_server:app", "--host", "0.0.0.0", "--port", "8082"] 
