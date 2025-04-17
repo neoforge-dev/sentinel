@@ -14,10 +14,12 @@ def test_another_passing():
     assert "hello world".split() == ["hello", "world"]
     assert "hello" in "hello world"
 
+@pytest.mark.xfail(reason="This test is designed to fail")
 def test_failing():
     """A test that fails."""
     assert 2 + 2 == 5, "This test is designed to fail"
 
+@pytest.mark.xfail(raises=ValueError, reason="This test is designed to raise an error")
 def test_error():
     """A test that raises an error."""
     raise ValueError("This test raises an error on purpose") 

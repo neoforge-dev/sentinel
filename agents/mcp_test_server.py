@@ -544,6 +544,7 @@ async def run_tests_local(config: TestExecutionConfig, db: DatabaseManager) -> U
                     summary = extract_test_summary(cleaned_output, config.runner)
                     
                     # Determine status
+                    yield "-- DEBUG: Determining status..."
                     if return_code != 0:
                         status = "failed"
                     elif results["failed"]:
@@ -552,8 +553,10 @@ async def run_tests_local(config: TestExecutionConfig, db: DatabaseManager) -> U
                         status = "error"
                     else:
                         status = "success"
+                    yield f"-- DEBUG: Status determined: {status}"
                     
                     # Create and store result
+                    yield "-- DEBUG: Creating TestResult object..."
                     result = TestResult(
                         id=result_id,
                         project_path=config.project_path,
@@ -562,14 +565,16 @@ async def run_tests_local(config: TestExecutionConfig, db: DatabaseManager) -> U
                         execution_mode=config.mode.value,
                         status=status,
                         summary=summary,
-                        details=full_output,
+                        details=full_output, # Store the raw buffer output
                         passed_tests=results["passed"],
                         failed_tests=results["failed"],
                         skipped_tests=results["skipped"],
                         execution_time=time.time() - start_time
                     )
+                    yield "-- DEBUG: TestResult object created."
                     
                     # Store result in database
+                    yield "-- DEBUG: Calling db.store_test_result..."
                     await db.store_test_result(
                         result_id=result.id,
                         status=result.status,
@@ -581,12 +586,16 @@ async def run_tests_local(config: TestExecutionConfig, db: DatabaseManager) -> U
                         execution_time=result.execution_time,
                         config=config.model_dump()
                     )
+                    yield "-- DEBUG: db.store_test_result awaited."
                     
                     # yield result # Removed: Do not yield the TestResult object in the stream
                     # Yield a sentinel string indicating completion instead?
                     # Or just let the stream end. The caller will fetch result from DB.
                     yield f"RESULT_STORED:{result_id}" # Yielding ID as sentinel
+                    yield "-- DEBUG: RESULT_STORED yielded."
                 except Exception as e:
+                    # Log the exception for debugging
+                    logger.error(f"Exception during stream result processing: {e}", exc_info=True)
                     yield f"ERROR: Failed to process test results: {str(e)}"
             
             return generate_output()

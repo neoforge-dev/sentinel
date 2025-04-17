@@ -43,6 +43,7 @@
 - Core functionality operational.
 - Local and Docker test execution modes implemented.
 - Focus on stabilizing tests and resolving warnings.
+- Sample tests designed to fail/error (`tests/test_sample`) now marked as `xfail`, allowing main suite to pass.
 
 ## What Works
 
@@ -60,6 +61,11 @@
 3. **Agent Framework**:
    - Basic agent implementation structure is in place
    - Agent communication with MCP servers is functional
+
+4. **Documentation**:
+   - Documentation of architectural constraints and design patterns
+   - Documentation of error propagation and resource management strategies
+   - Handled intentional failures in sample tests (`tests/test_sample/test_simple.py`) with `xfail`.
 
 ## What's Left to Build
 
@@ -109,6 +115,10 @@ The project has a functional core with both local and Docker test execution capa
    - More comprehensive tests needed for edge cases
    - Better test coverage for Docker execution failures
    - Additional integration tests for the complete system
+
+4. **Warnings from pytest-asyncio about fixture usage**
+5. **Docker running pip as root warnings**
+6. **Potential for similar logic issues in other parts of the codebase that need review**
 
 ## Key Working Features
 - **Core Agent**: Ollama integration, basic conversation loop.
@@ -193,6 +203,7 @@ The project has a functional core with both local and Docker test execution capa
 - [x] Comprehensive system architecture documentation with component relationships
 - [x] Documentation of architectural constraints and design patterns
 - [x] Documentation of error propagation and resource management strategies
+- [x] Handled intentional failures in sample tests (`tests/test_sample/test_simple.py`) with `xfail`.
 
 ## What's Left to Build
 
