@@ -107,6 +107,10 @@ class DatabaseManager:
             """
             CREATE TABLE IF NOT EXISTS test_results (
                 id TEXT PRIMARY KEY,
+                project_path TEXT,
+                test_path TEXT,
+                runner TEXT,
+                execution_mode TEXT,
                 status TEXT,
                 summary TEXT,
                 details TEXT,
@@ -158,6 +162,7 @@ class DatabaseManager:
         ]
         
         indexes = [
+            "CREATE INDEX IF NOT EXISTS idx_test_results_project_path ON test_results(project_path)",
             "CREATE INDEX IF NOT EXISTS idx_test_results_status ON test_results(status)",
             "CREATE INDEX IF NOT EXISTS idx_last_failed_tests_timestamp ON last_failed_tests(timestamp)",
             "CREATE INDEX IF NOT EXISTS idx_last_failed_tests_project_path ON last_failed_tests(project_path)"
@@ -340,49 +345,43 @@ class DatabaseManager:
             logger.info(f"Retrieved and processed test result with ID: {result_id}")
             return result
     
-    async def list_test_results(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """List recent test results."""
+    async def list_test_results(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """List all test results, returning dictionaries containing all necessary fields for ResultData model."""
         if not self.conn:
             await self.connect()
         
-        async with self.conn.execute(
-            """
+        # Select all columns necessary to build ResultData
+        query = """
             SELECT 
-                id, 
-                status, 
-                summary, 
-                details, 
-                passed_tests, 
-                failed_tests, 
-                skipped_tests, 
-                execution_time, 
-                config,
-                created_at 
-            FROM test_results 
-            ORDER BY created_at DESC 
+                id, project_path, test_path, runner, execution_mode, status, 
+                summary, details, passed_tests, failed_tests, skipped_tests, 
+                execution_time, created_at
+            FROM test_results
+            ORDER BY created_at DESC
             LIMIT ?
-            """,
-            (limit,)
-        ) as cursor:
-            results = await cursor.fetchall()
-            
-            # Convert rows to dictionaries and parse JSON fields
-            result_list = []
-            for row in results:
-                result_dict = {
-                    "id": row[0],
-                    "status": row[1],
-                    "summary": row[2],
-                    "details": row[3],
-                    "passed_tests": json.loads(row[4]),
-                    "failed_tests": json.loads(row[5]),
-                    "skipped_tests": json.loads(row[6]),
-                    "execution_time": row[7],
-                    "config": json.loads(row[8]),
-                    "created_at": row[9] # Use the correct index for created_at
-                }
-                result_list.append(result_dict)
-            return result_list
+        """
+        
+        results = []
+        try:
+            async with self.conn.execute(query, (limit,)) as cursor:
+                rows = await cursor.fetchall()
+                columns = [description[0] for description in cursor.description]
+                for row in rows:
+                    result_dict = dict(zip(columns, row))
+                    # Deserialize JSON fields
+                    result_dict['passed_tests'] = json.loads(result_dict.get('passed_tests', '[]'))
+                    result_dict['failed_tests'] = json.loads(result_dict.get('failed_tests', '[]'))
+                    result_dict['skipped_tests'] = json.loads(result_dict.get('skipped_tests', '[]'))
+                    # Optionally parse config if needed later, though not directly in ResultData
+                    # result_dict['config'] = json.loads(result_dict.get('config', '{}'))
+                    # Convert timestamp string back to datetime object if needed (or handle in Pydantic)
+                    # result_dict['created_at'] = datetime.fromisoformat(result_dict['created_at'])
+                    results.append(result_dict)
+        except Exception as e:
+            logger.error(f"Error listing test results: {e}", exc_info=True)
+            # Consider re-raising or returning empty list/error indicator
+        
+        return results
     
     async def get_last_failed_tests(self, project_path: Optional[str] = None) -> List[str]:
         """

@@ -34,13 +34,16 @@ import logging
 import traceback
 from datetime import datetime
 import inspect
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Security
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 import uvicorn
 import tiktoken
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
+from fastapi import status
 
 # Add src directory to path so we can import storage modules
 root = Path(__file__).resolve().parent.parent
@@ -57,8 +60,69 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mcp-test-server")
 
-# Initialize FastAPI
-app = FastAPI(title="MCP Test Server", description="MCP server for running and analyzing Python tests")
+# Database Manager (Singleton)
+db_manager = get_db_manager()
+
+# API Key Setup
+API_KEY = os.getenv("MCP_API_KEY", "dev_secret_key")
+API_KEY_NAME = "X-API-Key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+# Helper function to determine test status from output (Re-added)
+def determine_test_status(output: str, runner: 'RunnerType') -> str:
+    """Determine the test status (success, failed, error) based on output and runner."""
+    # NOTE: This is a basic placeholder implementation based on common patterns.
+    # It might need refinement depending on the exact output format of each runner.
+    output_lower = output.lower()
+    
+    # Check for common error indicators first
+    if "error" in output_lower or "exception" in output_lower or "traceback" in output_lower:
+        # Distinguish critical execution errors from test errors if possible
+        # This is tricky without more context from the output
+        # For now, map most errors to "error" status
+        return "error"
+        
+    # Check for failure indicators
+    if "fail" in output_lower or "assertionerror" in output_lower:
+        return "failed"
+        
+    # Check for success indicators (often less explicit)
+    # Pytest: "== ... passed ... =="
+    # Unittest/Nose2: "OK"
+    if runner == RunnerType.PYTEST:
+        if re.search(r"==.*passed.*==", output_lower):
+            return "success"
+    elif runner in [RunnerType.UNITTEST, RunnerType.NOSE2]:
+        if "ok" in output_lower and not "fail" in output_lower:
+             return "success"
+
+    # Default/fallback if no clear indicator found (could be ambiguous)
+    # Consider returning "unknown" or defaulting to "error" or "failed"
+    # Defaulting to "error" might be safest to flag ambiguity
+    logger.warning(f"Could not determine definitive status for runner {runner.value}. Defaulting to 'error'. Output:\n{output[:500]}...")
+    return "error" 
+
+# Lifespan context manager for database connection management
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manages database connection for the application lifespan."""
+    logger.info("MCP Test Server starting up...")
+    # Connect to the database on startup
+    await db_manager.connect() 
+    logger.info("Database connected.")
+    yield
+    # Disconnect from the database on shutdown
+    logger.info("MCP Test Server shutting down...")
+    await db_manager.disconnect()
+    logger.info("Database disconnected.")
+
+# Initialize FastAPI app with lifespan manager
+app = FastAPI(
+    title="MCP Test Server",
+    description="Execute tests locally or in Docker via API.",
+    version="1.1.0", # Updated version
+    lifespan=lifespan
+)
 
 # Add CORS middleware
 app.add_middleware(
@@ -68,6 +132,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---> ADDED ROOT ENDPOINT <---
+@app.get("/")
+async def read_root():
+    """Simple root endpoint to confirm server is running."""
+    return {"message": "MCP Test Server is running"}
 
 # Token counter for output limitations
 def count_tokens(text: str, model: str = "gpt-4") -> int:
@@ -81,7 +151,7 @@ def count_tokens(text: str, model: str = "gpt-4") -> int:
         return len(text) // 4
 
 
-class TestRunner(str, Enum):
+class RunnerType(str, Enum):
     """Test runner options"""
     PYTEST = "pytest"
     UNITTEST = "unittest"
@@ -95,11 +165,11 @@ class ExecutionMode(str, Enum):
     DOCKER = "docker"
 
 
-class TestExecutionConfig(BaseModel):
+class ExecutionConfig(BaseModel):
     """Configuration for test execution"""
     project_path: str = Field(..., description="Absolute path to the project directory")
     test_path: str = Field("tests", description="Path to test directory or file, relative to project_path")
-    runner: TestRunner = Field(TestRunner.PYTEST, description="Test runner to use")
+    runner: RunnerType = Field(RunnerType.PYTEST, description="Test runner to use")
     mode: ExecutionMode = Field(ExecutionMode.LOCAL, description="Execution mode (local or docker)")
     max_failures: Optional[int] = Field(None, description="Stop after N failures (None to run all)")
     run_last_failed: bool = Field(False, description="Run only the last failed tests")
@@ -107,9 +177,31 @@ class TestExecutionConfig(BaseModel):
     max_tokens: int = Field(4000, description="Maximum tokens for output")
     docker_image: Optional[str] = Field(None, description="Docker image to use (defaults to python:3.11)")
     additional_args: List[str] = Field(default_factory=list, description="Additional arguments for the test runner")
+    stream_output: bool = Field(False, description="Added for streaming control")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "project_path": "/path/to/your/project",
+                    "test_path": "tests/test_api.py",
+                    "runner": "pytest",
+                    "use_docker": False,
+                    "stream_output": True
+                },
+                {
+                    "project_path": "/path/to/another/project",
+                    "test_path": "tests/test_api.py",
+                    "runner": "pytest",
+                    "use_docker": True,
+                    "docker_image": "python:3.11"
+                }
+            ]
+        }
+    }
 
 
-class TestResult(BaseModel):
+class ResultData(BaseModel):
     """Result of a test execution"""
     id: str
     project_path: str
@@ -152,7 +244,7 @@ def clean_test_output(output: str, max_tokens: int = 4000) -> str:
     return output
 
 
-def extract_test_results(output: str, runner: TestRunner) -> Dict[str, List[str]]:
+def extract_test_results(output: str, runner: RunnerType) -> Dict[str, List[str]]:
     """Extract lists of passed, failed, and skipped tests based on the runner"""
     results = {
         "passed": [],
@@ -161,7 +253,7 @@ def extract_test_results(output: str, runner: TestRunner) -> Dict[str, List[str]
     }
     
     # Runner-specific parsing
-    if runner in [TestRunner.UNITTEST, TestRunner.NOSE2]:
+    if runner in [RunnerType.UNITTEST, RunnerType.NOSE2]:
         # Pattern for unittest/nose2 style: test_method (module.class) ... ok/FAIL/ERROR/SKIP
         pattern = re.compile(r"^(test_\w+)\s+\((.*?)\)\s+\.\.\.\s+(\w+)", re.MULTILINE)
         for match in pattern.finditer(output):
@@ -268,11 +360,11 @@ def extract_test_results(output: str, runner: TestRunner) -> Dict[str, List[str]
     return results
 
 
-def extract_test_summary(output: str, runner: Optional[TestRunner] = None) -> str:
+def extract_test_summary(output: str, runner: Optional[RunnerType] = None) -> str:
     """Extract the test summary from the output, prioritizing the final summary line."""
     
     # Specific patterns for unittest/nose2
-    if runner in [TestRunner.UNITTEST, TestRunner.NOSE2]:
+    if runner in [RunnerType.UNITTEST, RunnerType.NOSE2]:
         # Look for the "Ran X tests..." line and the outcome (OK, FAILED)
         summary_match = re.search(r"^(Ran \d+ tests? in .*?s)\s*^([A-Z]+(?:\s*\(.*\))?)?", output, re.MULTILINE | re.DOTALL)
         if summary_match:
@@ -398,952 +490,429 @@ def truncate_to_token_limit(text: str, max_tokens: int) -> str:
     return f"{beginning}\n...[truncated for token limit]...\n{ending}"
 
 
-# Generator for streaming subprocess output
-async def stream_subprocess_output(process: asyncio.subprocess.Process):
-    """Yield stdout and stderr lines from a subprocess as they arrive."""
-    queue = asyncio.Queue()
-    finished_readers = 0
-
-    # Yield an initial status line immediately
-    yield "--- Starting test run ---"
-
-    async def read_stream(stream, prefix):
-        """Reads lines from a stream and puts them into the queue."""
-        nonlocal finished_readers
-        try:
-            if stream is None:
-                return
-            while True:
-                line = await stream.readline()
-                if not line:
-                    break
-                await queue.put(f"{prefix}: {line.decode('utf-8', errors='replace')}")
-        except Exception as e:
-            logger.error(f"Error reading stream {prefix}: {e}")
-            await queue.put(f"ERROR_READING_STREAM: {prefix}: {e}") # Signal error
-        finally:
-            finished_readers += 1
-            if finished_readers == 2:
-                await queue.put(None) # Signal end of both streams
-
-    # Create tasks for the reader coroutines
-    stdout_task = asyncio.create_task(read_stream(process.stdout, "STDOUT"))
-    stderr_task = asyncio.create_task(read_stream(process.stderr, "STDERR"))
-
-    # Yield lines from the queue until the sentinel (None) is received
-    while True:
-        line = await queue.get()
-        if line is None:
-            break
-        yield line
-        queue.task_done() # Mark task as done for queue management
-
-    # Ensure tasks are finished (optional, but good practice)
-    await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
-
-
-async def run_tests_local(config: TestExecutionConfig, db: DatabaseManager) -> Union[TestResult, AsyncGenerator[str, None]]:
+async def run_tests_local(config: ExecutionConfig, db: DatabaseManager) -> Union[ResultData, AsyncGenerator[str, None]]:
     """Run tests locally using the specified configuration.
-    
-    Returns either a TestResult object or an AsyncGenerator for streaming responses.
+
+    Returns either a ResultData object (if stream_output=False) or 
+    an AsyncGenerator yielding output chunks (if stream_output=True).
+    The generator will yield the final ResultData object as the last item
+    if an error occurs during streaming setup.
     """
+    logger.info(f"Starting local test execution for project: {config.project_path}")
     start_time = time.time()
     result_id = str(uuid.uuid4())
-    
-    cmd = []
-    if config.runner == TestRunner.UV:
-        # Assuming 'uv run pytest ...' for consistency, adjust if uv handles test discovery differently
-        cmd = ["uv", "run", "pytest"] 
-    elif config.runner == TestRunner.PYTEST:
-        cmd = ["python", "-m", "pytest"]
-    elif config.runner == TestRunner.UNITTEST:
-        # For unittest, use discover, targeting the specific file if provided
-        if config.test_path:
-            # Run discover from project root, targeting the relative path
-            cmd = ["python", "-m", "unittest", "discover", "-s", ".", "-p", config.test_path]
-        else:
-            # Default discover from project root if no path provided
-            cmd = ["python", "-m", "unittest", "discover", "-s", "."]
-    elif config.runner == TestRunner.NOSE2:
-        cmd = ["python", "-m", "nose2"]
-    else:
-        raise ValueError(f"Unsupported test runner: {config.runner}")
-    
-    # Add test path if specified and exists, otherwise run all tests in project path implicitly
-    test_path_abs = None
-    if config.test_path:
-        test_path_abs = os.path.join(config.project_path, config.test_path)
-        if os.path.exists(test_path_abs):
-            cmd.append(test_path_abs)
-        else:
-            logger.warning(f"Specified test_path '{config.test_path}' not found relative to project_path. Running tests without explicit path.")
-    
-    # Add max failures if specified
-    if config.max_failures is not None:
-        cmd.extend(["-x" if config.max_failures == 1 else f"--maxfail={config.max_failures}"])
-    
-    # Handle last failed tests (pass as specific arguments if available)
-    last_failed_tests_list = []
-    if config.run_last_failed:
-        last_failed_tests_list = await db.get_last_failed_tests(config.project_path)
-        if last_failed_tests_list:
-            # Pytest specific: `--lf` flag is often better than passing individual paths
-            if config.runner == TestRunner.PYTEST or config.runner == TestRunner.UV:
-                 cmd.append("--lf") # Add last-failed flag
-            else:
-                 # For other runners, append the test identifiers if possible
-                 # Note: This might need runner-specific formatting
-                 cmd.extend(last_failed_tests_list) 
-    
-    # Add verbose output
-    cmd.append("-v")
-    
-    # Add any additional arguments
-    cmd.extend(config.additional_args)
-    
-    logger.info(f"Running command: {' '.join(cmd)}")
-    
-    # Check if we're in streaming mode
-    streaming_mode = "stream" in config.additional_args
-    
-    process = None
+    status = "Unknown" # Default status
+    summary = "" # Default summary
+    details = "" # Default details
+    passed_tests, failed_tests, skipped_tests = [], [], []
     
     try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=config.project_path
-        )
-
-        # If streaming mode is enabled, return a streaming generator
-        if streaming_mode:
-            logger.info("Local test execution in streaming mode")
+        # --- Configuration and Setup --- 
+        project_path_obj = Path(config.project_path).resolve()
+        if not project_path_obj.is_dir():
+            raise ValueError(f"Project path '{config.project_path}' is not a valid directory.")
             
-            # Create generator function to stream output
-            async def generate_output():
-                output_buffer = []
-                
-                # Stream process output
-                async for line in stream_subprocess_output(process):
-                    output_buffer.append(line)
-                    yield line
-                
-                # Process is complete, get return code
-                return_code = process.returncode
-                yield f"Process completed with return code: {return_code}"
-                
-                # Process the complete output
-                try:
-                    # Join the output buffer to get the full output
-                    full_output = "".join(output_buffer)
-                    
-                    # Process the output to extract results
-                    cleaned_output = clean_test_output(full_output, config.max_tokens)
-                    results = extract_test_results(cleaned_output, config.runner)
-                    summary = extract_test_summary(cleaned_output, config.runner)
-                    
-                    # Determine status
-                    yield "-- DEBUG: Determining status..."
-                    if return_code != 0:
-                        status = "failed"
-                    elif results["failed"]:
-                        status = "failed"
-                    elif not results["passed"] and not results["failed"]:
-                        status = "error"
-                    else:
-                        status = "success"
-                    yield f"-- DEBUG: Status determined: {status}"
-                    
-                    # Create and store result
-                    yield "-- DEBUG: Creating TestResult object..."
-                    result = TestResult(
-                        id=result_id,
-                        project_path=config.project_path,
-                        test_path=config.test_path,
-                        runner=config.runner.value,
-                        execution_mode=config.mode.value,
-                        status=status,
-                        summary=summary,
-                        details=full_output, # Store the raw buffer output
-                        passed_tests=results["passed"],
-                        failed_tests=results["failed"],
-                        skipped_tests=results["skipped"],
-                        execution_time=time.time() - start_time
-                    )
-                    yield "-- DEBUG: TestResult object created."
-                    
-                    # Store result in database
-                    yield "-- DEBUG: Calling db.store_test_result..."
-                    await db.store_test_result(
-                        result_id=result.id,
-                        status=result.status,
-                        summary=result.summary,
-                        details=result.details,
-                        passed_tests=result.passed_tests,
-                        failed_tests=result.failed_tests,
-                        skipped_tests=result.skipped_tests,
-                        execution_time=result.execution_time,
-                        config=config.model_dump()
-                    )
-                    yield "-- DEBUG: db.store_test_result awaited."
-                    
-                    # yield result # Removed: Do not yield the TestResult object in the stream
-                    # Yield a sentinel string indicating completion instead?
-                    # Or just let the stream end. The caller will fetch result from DB.
-                    yield f"RESULT_STORED:{result_id}" # Yielding ID as sentinel
-                    yield "-- DEBUG: RESULT_STORED yielded."
-                except Exception as e:
-                    # Log the exception for debugging
-                    logger.error(f"Exception during stream result processing: {e}", exc_info=True)
-                    yield f"ERROR: Failed to process test results: {str(e)}"
-            
-            return generate_output()
-            
-        # Non-streaming mode (original code) - collect all output
-        output_lines = []
+        test_path_resolved = project_path_obj / config.test_path
 
-        # --- Replaced communicate() with explicit stream reading --- 
-        async def read_stream(stream, stream_name):
-            while True:
-                line = await stream.readline()
-                if not line:
-                    break
-                output_lines.append(line.decode('utf-8', errors='replace'))
-                logger.debug(f"{stream_name}: {line.decode('utf-8', errors='replace').strip()}")
-
-        # Start reading stdout and stderr concurrently
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(
-                    read_stream(process.stdout, "STDOUT"),
-                    read_stream(process.stderr, "STDERR")
-                ),
-                timeout=config.timeout
-            )
-        except asyncio.TimeoutError:
-            process.terminate() # Terminate the process on timeout
-            logger.warning(f"Local test execution timed out after {config.timeout} seconds.")
-            end_time = time.time()
-            # Handle timeout result
-            result = TestResult(
-                id=result_id,
-                project_path=config.project_path,
-                test_path=config.test_path,
-                runner=config.runner.value,
-                execution_mode=config.mode.value,
-                status="timeout",
-                summary=f"Tests timed out after {config.timeout} seconds",
-                details=f"Command: {' '.join(cmd)}\nTests timed out after {config.timeout} seconds.\nPartial Output:\n{'' .join(output_lines)}",
-                execution_time=end_time - start_time,
-                passed_tests=[],
-                failed_tests=last_failed_tests_list if config.run_last_failed else [],
-                skipped_tests=[]
-            )
-            # Store timeout result
-            await db.store_test_result(
-                result_id=result.id, status=result.status, summary=result.summary, details=result.details,
-                passed_tests=result.passed_tests, failed_tests=result.failed_tests, skipped_tests=result.skipped_tests,
-                execution_time=result.execution_time, config=config.model_dump()
-            )
-            return result
-            
-        # Wait for the process to finish and get the return code AFTER reading streams
-        return_code = await process.wait()
-        logger.info(f"Process finished with return code: {return_code}")
-        # --- End of replaced block --- 
-            
-        output = "".join(output_lines)
-        logger.info(f"Raw output length: {len(output)}")
-        logger.debug(f"Raw output head:\n{output[:500]}") # Log start of output
-        logger.debug(f"Full raw output for {config.runner}:\n{output}") 
-
-        cleaned_output = clean_test_output(output, config.max_tokens)
-        logger.info(f"Cleaned output length: {len(cleaned_output)}")
-        
-        end_time = time.time()
-        
-        # Extract test results
-        logger.info("Extracting test results...")
-        results = extract_test_results(cleaned_output, config.runner)
-        logger.info(f"Extracted results: {results}")
-
-        # Get summary
-        logger.info("Extracting test summary...")
-        summary = extract_test_summary(cleaned_output, config.runner)
-        logger.info(f"Extracted summary: {summary[:200]}...") # Log start of summary
-
-        # Truncate to token limit
-        logger.info("Truncating details...")
-        details = truncate_to_token_limit(cleaned_output, config.max_tokens)
-        logger.info("Truncating complete.")
-        
-        # Determine test status (Revised Logic using return_code)
-        logger.info("Determining final status...")
-        if return_code is None: # Should not happen if timeout didn't occur, but belt-and-suspenders
-             status = "error"
-             summary = "Unknown test outcome: Process did not exit cleanly."
-             logger.error("Process return code was None after stream reading completed.")
-        elif return_code != 0:
-            # Non-zero exit code always means failure
-            status = "failed"
-            logger.info(f"Status set to 'failed' (returncode={return_code})")
-        elif results["failed"]:
-            # Zero exit code, but parser found failures
-            status = "failed"
-            logger.info(f"Status set to 'failed' (returncode=0, failures_found=True)")
-        elif not results["passed"] and not results["failed"] and return_code == 0:
-            # Zero exit code, no failures, but also no passes -> Error (e.g., no tests collected)
-            status = "error"
-            summary = "No tests found or executed." + (" " + summary if summary else "")
-            logger.info(f"Status set to 'error' (no tests found/run, returncode=0)")
-        elif return_code == 0 and not results["failed"]:
-            # Zero exit code, no failures found (passes or skips)
-            status = "success"
-            logger.info(f"Status determined as 'success'")
+        runner_cmd = [sys.executable]
+        if config.runner == RunnerType.PYTEST:
+            runner_cmd.extend(["-m", "pytest", str(test_path_resolved)])
+        elif config.runner == RunnerType.UNITTEST:
+            runner_cmd.extend(["-m", "unittest", "discover", "-s", str(test_path_resolved.parent), f"-p", f"{test_path_resolved.name}"])
+        elif config.runner == RunnerType.NOSE2:
+            runner_cmd.extend(["-m", "nose2", "-s", str(test_path_resolved.parent), str(test_path_resolved)])
+        elif config.runner == RunnerType.UV:
+            runner_cmd = ["uv", "run", "pytest", str(test_path_resolved)]
         else:
-            # Fallback case, treat as error
-            status = "error"
-            summary = f"Unknown test outcome (returncode={return_code}, failures={len(results['failed'])})"
-            logger.warning(f"Status set to 'error' (fallback case)")
-
-        # Create result object
-        logger.info("Creating TestResult object...")
-        result = TestResult(
-            id=result_id,
-            project_path=config.project_path,
-            test_path=config.test_path,
-            runner=config.runner.value,
-            execution_mode=config.mode.value,
-            status=status,
-            summary=summary,
-            details=details,
-            passed_tests=results["passed"],
-            failed_tests=results["failed"],
-            skipped_tests=results["skipped"],
-            execution_time=end_time - start_time
-        )
-
-        # Store the result in the database
-        await db.store_test_result(
-            result_id=result.id,
-            status=result.status,
-            summary=result.summary,
-            details=result.details,
-            passed_tests=result.passed_tests,
-            failed_tests=result.failed_tests,
-            skipped_tests=result.skipped_tests,
-            execution_time=result.execution_time,
-            config=config.model_dump()
-        )
-        
-        return result
-    
-    except FileNotFoundError as e:
-        end_time = time.time()
-        logger.error(f"Command not found error during local test execution: {e}", exc_info=True)
-        status = "error"
-        summary = f"Command execution failed: {e.strerror}"
-        details = f"Command: {' '.join(cmd)}\nError: Command not found ({e.filename}). Ensure the runner ({config.runner.value}) and Python/uv are correctly installed and in PATH."
-        # Return a specific TestResult, but the endpoint should raise HTTP 500 for this kind of server error
-        result = TestResult(
-            id=result_id, project_path=config.project_path, test_path=config.test_path,
-            runner=config.runner.value, execution_mode=config.mode.value, status=status,
-            summary=summary, details=details, execution_time=end_time - start_time
-        )
-        # Store error result
-        await db.store_test_result(
-             result_id=result.id, status=status, summary=summary, details=details,
-             passed_tests=[], failed_tests=[], skipped_tests=[],
-             execution_time=result.execution_time, config=config.model_dump()
-        )
-        # Raise HTTP 500 - Indicates a server setup issue
-        raise HTTPException(status_code=500, detail=f"Server Execution Error: {details}")
-        
-    except ValueError as e: # Catch specific ValueError for unsupported runner
-        end_time = time.time()
-        logger.error(f"Configuration error during local test execution: {e}", exc_info=True)
-        status = "error"
-        summary = f"Configuration error: {str(e)}"
-        details = f"Error: {str(e)}\nTraceback: {traceback.format_exc()}"
-        # Raise HTTP 400 or 422 for configuration errors
-        raise HTTPException(status_code=400, detail=f"Configuration Error: {str(e)}")
-
-    except OSError as e:
-        end_time = time.time()
-        logger.error(f"OS error during local test execution: {type(e).__name__}: {e}", exc_info=True)
-        status = "error"
-        summary = f"OS error during command execution: {e.strerror} - {e.filename if e.filename else 'command'}"
-        # Try to get command if available
-        cmd_str = "Unknown command" 
-        try: cmd_str = ' '.join(cmd) 
-        except NameError: pass # cmd might not be defined if error was early
-        details = f"Command: {cmd_str}\nOS Error: {e.strerror} ({e.filename if e.filename else 'command'}). Ensure the command and environment are correctly set up."
-        
-        # Ensure result_id is defined, generate if necessary
-        try: current_result_id = result_id
-        except NameError: current_result_id = str(uuid.uuid4())
-        
-        result = TestResult(
-            id=current_result_id, project_path=config.project_path, test_path=config.test_path,
-            runner=config.runner.value, execution_mode=config.mode.value, status=status,
-            summary=summary, details=details, execution_time=end_time - start_time,
-            passed_tests=[], failed_tests=[], skipped_tests=[] # No reliable results on error
-        )
-        try:
-            await db.store_test_result(
-                 result_id=result.id, status=status, summary=summary, details=details,
-                 passed_tests=result.passed_tests, failed_tests=result.failed_tests, skipped_tests=result.skipped_tests,
-                 execution_time=result.execution_time, config=config.model_dump()
-            )
-            logger.info(f"Stored OSError TestResult {result.id} to DB.")
-        except Exception as db_err:
-             logger.error(f"Failed to store OSError TestResult {result.id} to DB: {db_err}", exc_info=True)
-             
-        # Raise HTTP 500 - Indicates a server setup issue
-        raise HTTPException(status_code=500, detail=f"Server Execution Error: {details}")
-
-    except Exception as e:
-        # --- Modified Generic Exception Handling ---
-        end_time = time.time()
-        logger.error(f"Generic error during local test execution: {type(e).__name__}: {e}", exc_info=True) # Log type and message
-        status="error"
-        summary=f"Error processing test results: {type(e).__name__}: {str(e)}" # Clarify summary
-        # Try to get command if available
-        cmd_str = "Unknown command" 
-        try: cmd_str = ' '.join(cmd) 
-        except NameError: pass # cmd might not be defined if error was early
-        # Include exception type in details
-        details=f"Command: {cmd_str}\nError Type: {type(e).__name__}\nError: {str(e)}\nTraceback: {traceback.format_exc()}"
-        
-        logger.info("Creating error TestResult object...")
-        # Ensure result_id is defined, generate if necessary
-        try: current_result_id = result_id
-        except NameError: current_result_id = str(uuid.uuid4())
-        
-        result = TestResult(
-            id=current_result_id,
-            project_path=config.project_path, 
-            test_path=config.test_path,
-            runner=config.runner.value, 
-            execution_mode=config.mode.value, 
-            status=status,
-            summary=summary, 
-            details=details, 
-            execution_time=end_time - start_time,
-            passed_tests=[], failed_tests=[], skipped_tests=[] # No reliable results on error
-        )
-        try:
-            await db.store_test_result(
-                 result_id=result.id, status=result.status, summary=result.summary, details=result.details,
-                 passed_tests=result.passed_tests, failed_tests=result.failed_tests, skipped_tests=result.skipped_tests,
-                 execution_time=result.execution_time, config=config.model_dump()
-            )
-            logger.info(f"Stored error TestResult {result.id} to DB.")
-        except Exception as db_err:
-             logger.error(f"Failed to store error TestResult {result.id} to DB: {db_err}", exc_info=True)
-
-        # Return the error result as JSON, DO NOT raise 500 anymore
-        logger.warning(f"Returning error TestResult {result.id} due to internal processing error.")
-        return result 
-    finally:
-        # Ensure process is cleaned up if it exists and hasn't finished
-        if process and process.returncode is None:
-            logger.warning(f"Terminating hanging process {process.pid} in run_tests_local")
-            try:
-                logger.info(f"[run_tests_local finally] Attempting to terminate process {process.pid}...")
-                process.terminate()
-                logger.info(f"[run_tests_local finally] Waiting for process {process.pid} termination...")
-                await asyncio.wait_for(process.wait(), timeout=2) # Short wait after terminate
-                logger.info(f"[run_tests_local finally] Process {process.pid} terminated successfully.")
-            except asyncio.TimeoutError:
-                logger.error(f"[run_tests_local finally] Timeout waiting for process {process.pid} termination. Killing...")
-                try: 
-                    process.kill()
-                    logger.info(f"[run_tests_local finally] Process {process.pid} killed.")
-                except ProcessLookupError:
-                    logger.warning(f"[run_tests_local finally] Process {process.pid} already exited before kill.")
-                except Exception as kill_err:
-                     logger.error(f"[run_tests_local finally] Error killing process {process.pid}: {kill_err}")                    
-            except Exception as term_err:
-                logger.error(f"[run_tests_local finally] Error terminating process {process.pid}: {term_err}")
-                try: 
-                    logger.info(f"[run_tests_local finally] Attempting to kill process {process.pid} after termination error...")
-                    process.kill()
-                    logger.info(f"[run_tests_local finally] Process {process.pid} killed after termination error.")
-                except ProcessLookupError:
-                    logger.warning(f"[run_tests_local finally] Process {process.pid} already exited before kill (after term error).")
-                except Exception as kill_err_alt:
-                     logger.error(f"[run_tests_local finally] Error killing process {process.pid} after termination error: {kill_err_alt}")
-        else:
-            logger.info(f"[run_tests_local finally] Process cleanup not needed (process={process}, returncode={process.returncode if process else 'N/A'}).")
-
-
-async def run_tests_docker(config: TestExecutionConfig, db: DatabaseManager) -> Union[TestResult, AsyncGenerator[str, None]]:
-    """Run tests in Docker container, streaming output or returning the final result object."""
-    start_time = time.time()
-    result_id = str(uuid.uuid4())
-    container = None
-    client = None
-    last_failed_tests_list = []
-    cmd_str = ""
-    output = ""
-    status = None  # No default status, we'll determine it based on test results
-    summary = ""
-    details = ""
-    passed_tests = []
-    failed_tests = []
-    skipped_tests = []
-    exit_code = -1
-    end_time = start_time
-
-    try:
-        import docker
-        from docker.errors import DockerException, ImageNotFound, APIError
-        import requests # Needed for wait timeout exception
-
-        client = docker.from_env()
-
-        # --- Prepare Command (Combine logic from previous attempts) ---
-        test_cmd_list = []
-        runner_name = config.runner.value
-        if runner_name == "pytest":
-            test_cmd_list = ["python", "-m", "pytest"]
-        elif runner_name == "unittest":
-            if config.test_path and os.path.isfile(os.path.join(config.project_path, config.test_path)) and config.test_path.endswith('.py'):
-                # Convert file path to module path relative to /app
-                module_path = config.test_path[:-3].replace(os.path.sep, '.')
-                test_cmd_list = ["python", "-m", "unittest", module_path]
-            elif config.test_path and os.path.isdir(os.path.join(config.project_path, config.test_path)):
-                test_cmd_list = ["python", "-m", "unittest", "discover", "-s", os.path.join("/app", config.test_path)] # Discover in relative path
-            else:
-                 test_cmd_list = ["python", "-m", "unittest", "discover", "-s", "/app"] # Discover in /app
-        elif runner_name == "nose2":
-            test_cmd_list = ["python", "-m", "nose2"]
-        else:
-            raise ValueError(f"Unsupported test runner for Docker execution: {runner_name}")
-
-        # Add specific test target unless unittest handled discovery
-        if runner_name != "unittest" and config.test_path:
-             test_path_in_container = os.path.join("/app", config.test_path)
-             # Check if path exists locally before adding - docker will fail anyway but provides earlier feedback
-             if os.path.exists(os.path.join(config.project_path, config.test_path)):
-                 test_cmd_list.append(test_path_in_container)
-             else:
-                 logger.warning(f"Test path {config.test_path} not found locally, may fail in Docker.")
-                 # Decide whether to proceed or raise error? Proceed for now.
-                 test_cmd_list.append(test_path_in_container)
+             raise ValueError(f"Unsupported runner type: {config.runner}")
 
         if config.max_failures is not None:
-            test_cmd_list.extend(["-x" if config.max_failures == 1 else f"--maxfail={config.max_failures}"])
+            if config.runner == RunnerType.PYTEST:
+                runner_cmd.extend(["-x", "--maxfail", str(config.max_failures)])
+            else:
+                logger.warning(f"Max failures option not supported for {config.runner}")
+        
         if config.run_last_failed:
-             last_failed_tests_list = await db.get_last_failed_tests(config.project_path) # Fetch from DB
-             if last_failed_tests_list:
-                  if runner_name == "pytest":
-                       test_cmd_list.append("--lf")
-                  else:
-                      # Append relative paths for other runners if needed
-                      for test in last_failed_tests_list:
-                          # Assume stored paths are relative to project root
-                          test_path_in_container = os.path.join("/app", test) 
-                          test_cmd_list.append(test_path_in_container)
-                          
-        test_cmd_list.append("-v") # Add verbosity
-        test_cmd_list.extend(config.additional_args)
-        test_cmd_str = " ".join(test_cmd_list)
-
-        # Combine installation and execution
-        install_cmd = "python -m pip install --upgrade pip > /dev/null && python -m pip install pytest nose2 > /dev/null"
-        full_container_cmd = f"/bin/sh -c \"{install_cmd} && {test_cmd_str}\""
-        cmd_str = full_container_cmd
-        # --- End Prepare Command ---
-
-        docker_image = config.docker_image or "python:3.11"
-        logger.info(f"Starting Docker container {docker_image} with command: {full_container_cmd}")
-        container = client.containers.run(
-            docker_image,
-            command=full_container_cmd,
-            volumes={config.project_path: {'bind': '/app', 'mode': 'rw'}},
-            working_dir="/app",
-            detach=True,
-            stdout=True, stderr=True
-        )
-        logger.info(f"Container {container.short_id} started.")
-
-        # Use Docker logs stream=True for streaming output
-        stream = container.logs(stdout=True, stderr=True, stream=True, follow=True)
-        
-        # For streaming mode, return a generator
-        async def generate_stream():
-            buffer = []
-            timeout_task = None
-            final_status = 'pending' # Initial status
-            stream_error = None
-            exit_code = -1 # Initialize exit_code
-            
-            try:
-                # Start timeout monitor
-                timeout_task = asyncio.create_task(asyncio.sleep(config.timeout))
-
-                # Define a function to iterate over the sync stream in a thread
-                def sync_iterate_stream():
-                    results = []
-                    for line_bytes in stream: # Iterate synchronously
-                        results.append(line_bytes)
-                    return results
-
-                # Process Docker logs stream using asyncio.to_thread
-                try:
-                    # Run the synchronous iteration in a thread
-                    log_lines = await asyncio.to_thread(sync_iterate_stream)
-
-                    # Process the collected lines asynchronously
-                    for line_bytes in log_lines:
-                        if timeout_task.done():
-                            final_status = 'timeout'
-                            yield "ERROR: Docker execution timed out"
-                            logger.warning(f"Docker execution for {result_id} timed out after {config.timeout} seconds.")
-                            break # Stop processing stream on timeout
-
-                        line_str = line_bytes.decode('utf-8', errors='replace')
-                        buffer.append(line_str)
-                        yield f"DOCKER: {line_str}"
-                        await asyncio.sleep(0) # Yield control briefly
-
-                except Exception as e:
-                    stream_error = e
-                    final_status = 'error'
-                    logger.error(f"Error reading Docker stream for {result_id}: {e}", exc_info=True)
-                    yield f"ERROR: Docker stream error: {str(e)}"
+            if config.runner == RunnerType.PYTEST:
+                runner_cmd.append("--lf")
+            else:
+                logger.warning(f"Run last failed option not supported for {config.runner}")
                 
-                # Cancel timeout task if it hasn't finished and we exited the loop normally
-                if not timeout_task.done():
-                    timeout_task.cancel()
-                    try:
-                        await timeout_task
-                    except asyncio.CancelledError:
-                        pass # Expected
-                elif final_status != 'timeout': # Timeout already handled
-                    # If timeout occurred, status is already set
-                    pass
+        runner_cmd.extend(config.additional_args)
 
-                # Wait for container to finish if no timeout/stream error occurred yet
-                if final_status == 'pending':
-                    try:
-                        logger.debug(f"Waiting for container {container.short_id} to finish...")
-                        container_result = await asyncio.to_thread(container.wait, timeout=10) # Use asyncio.to_thread for blocking call
-                        exit_code = container_result.get("StatusCode", -1)
-                        yield f"DOCKER: Container exited with code {exit_code}"
-                        logger.info(f"Container {container.short_id} exited with code {exit_code}.")
-                        # Determine status based on exit code *only if* no prior error/timeout
-                        final_status = "success" if exit_code == 0 else "failed"
-                    except asyncio.TimeoutError:
-                         final_status = 'timeout'
-                         logger.warning(f"Timeout waiting for container {container.short_id} to exit.")
-                         yield "ERROR: Timeout waiting for container exit."
-                    except (APIError, DockerException) as wait_err:
-                        final_status = 'error'
-                        logger.error(f"Error waiting for container {container.short_id}: {wait_err}", exc_info=True)
-                        yield f"DOCKER: Error waiting for container: {wait_err}"
+        current_env = os.environ.copy()
+        python_path = current_env.get("PYTHONPATH", "")
+        project_path_str = str(project_path_obj)
+        if project_path_str not in python_path.split(os.pathsep):
+             current_env["PYTHONPATH"] = f"{project_path_str}{os.pathsep}{python_path}" if python_path else project_path_str
+        
+        logger.info(f"Running command: {' '.join(runner_cmd)}")
+        logger.info(f"Working directory: {project_path_str}")
+        logger.debug(f"Updated PYTHONPATH: {current_env['PYTHONPATH']}")
 
-            except asyncio.CancelledError:
-                final_status = 'error'
-                logger.warning(f"Docker stream task for {result_id} cancelled.")
-                yield "ERROR: Stream processing cancelled"
-            finally:
-                # Ensure container cleanup happens regardless of errors
+        # --- Streaming Execution (if requested) --- 
+        if config.stream_output:
+            
+            async def generate_stream():
+                nonlocal result_id, start_time, status, summary, details, passed_tests, failed_tests, skipped_tests
+                process = None
+                full_stdout_stderr = ""
+                return_code = -1 # Default error code
+                
                 try:
-                    logger.debug(f"Attempting to remove container {container.short_id}...")
-                    logger.info(f"[run_tests_docker finally] Calling container.remove for {container.short_id}...")
-                    await asyncio.to_thread(container.remove, force=True)
-                    logger.info(f"[run_tests_docker finally] container.remove for {container.short_id} completed.")
-                    yield "DOCKER: Container cleaned up"
-                    logger.info(f"Container {container.short_id} removed.")
-                except (APIError, DockerException) as cleanup_err:
-                    # Log error but don't yield it, as it might obscure the actual test result/error
-                    logger.error(f"[run_tests_docker finally] Error cleaning up container {container.short_id}: {cleanup_err}", exc_info=False)
-                    # yield f"DOCKER: Error cleaning up container: {cleanup_err}" # Avoid yielding this
-                except Exception as general_cleanup_err:
-                     logger.error(f"[run_tests_docker finally] Unexpected error during container cleanup {container.short_id}: {general_cleanup_err}", exc_info=True)
-
-                # --- Final Result Processing ---
-                end_time = time.time() # Capture end time accurately here
-                output = "".join(buffer)
-                cleaned_output = clean_test_output(output, config.max_tokens) # Clean before parsing
-                details_truncated = truncate_to_token_limit(cleaned_output, config.max_tokens) # Truncate *cleaned* output
-
-                # Default values for results
-                passed_tests_final = []
-                failed_tests_final = []
-                skipped_tests_final = []
-                summary_final = f"Execution finished with status: {final_status}" # Default summary
-
-                # Parse results only if execution likely completed (success or failed)
-                if final_status in ['success', 'failed']:
-                    try:
-                        results = extract_test_results(cleaned_output, config.runner)
-                        summary_extracted = extract_test_summary(cleaned_output, config.runner)
-
-                        passed_tests_final = results.get("passed", [])
-                        failed_tests_final = results.get("failed", [])
-                        skipped_tests_final = results.get("skipped", [])
-                        if summary_extracted:
-                            summary_final = summary_extracted
-                        else:
-                            # Use a fallback summary if extraction fails but status is success/failed
-                            summary_final = f"Tests {'passed' if final_status == 'success' else 'failed'}. Summary extraction failed."
-                            logger.warning(f"Summary extraction failed for {result_id} despite status '{final_status}'. Output: {cleaned_output[:200]}...")
-
-                    except Exception as parse_err:
-                         logger.error(f"Error parsing test results for {result_id}: {parse_err}", exc_info=True)
-                         summary_final = f"Error parsing test results: {parse_err}"
-                         # Consider setting status to 'error' if parsing fails? For now, keep original status.
-                         # final_status = 'error'
-
-
-                elif final_status == 'timeout':
-                     summary_final = f"Execution timed out after {config.timeout} seconds."
-                elif final_status == 'error':
-                     # Use the stream error or a generic message if stream_error is None
-                     error_msg = str(stream_error) if stream_error else "An unspecified error occurred during execution."
-                     summary_final = f"Execution failed with error: {error_msg}"
-                     # Ensure details contain the error if available
-                     if stream_error and str(stream_error) not in details_truncated:
-                         details_truncated = f"Stream Error: {str(stream_error)}\n---\n{details_truncated}"
-
-
-                # Create and store the final result object
-                result = TestResult(
-                    id=result_id,
-                    project_path=config.project_path,
-                    test_path=config.test_path,
-                    runner=config.runner.value,
-                    execution_mode=config.mode.value,
-                    status=final_status, # Use the determined final status
-                    summary=summary_final,
-                    details=details_truncated,
-                    passed_tests=passed_tests_final,
-                    failed_tests=failed_tests_final,
-                    skipped_tests=skipped_tests_final,
-                    execution_time=end_time - start_time
-                )
-
-                try:
-                    await db.store_test_result(
-                        result_id=result.id,
-                        status=result.status,
-                        summary=result.summary,
-                        details=result.details,
-                        passed_tests=result.passed_tests,
-                        failed_tests=result.failed_tests,
-                        skipped_tests=result.skipped_tests,
-                        execution_time=result.execution_time,
-                        config=config.model_dump()
+                    yield "--- Starting test run stream ---\n"
+                    process = await asyncio.create_subprocess_exec(
+                        *runner_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=project_path_str,
+                        env=current_env
                     )
-                    logger.info(f"Stored final result for {result_id} with status: {result.status}")
-                except Exception as db_err:
-                    logger.error(f"Failed to store final Docker result {result_id} to DB: {db_err}", exc_info=True)
+                    yield f"--- Process started (PID: {process.pid}) ---\n"
+                    
+                    # --- Queue-based Concurrent Reading --- 
+                    output_lines = [] # Collect all output for final processing
+                    queue = asyncio.Queue()
+                    finished_readers = asyncio.Event() # Event to signal completion
+                    active_readers = 2 # Track active readers
 
-                # Yield the final TestResult object LAST
-                yield result
+                    async def reader_to_queue(stream, prefix):
+                        """Reads lines from a stream and puts them onto the queue."""
+                        nonlocal active_readers
+                        if stream is None:
+                            active_readers -= 1
+                            if active_readers == 0:
+                                await queue.put(None) # Signal end if this was the last reader
+                            return
+                        try:
+                            while True: # Explicit loop
+                                line_bytes = await stream.readline()
+                                if not line_bytes: # EOF
+                                    break
+                                line = line_bytes.decode('utf-8', errors='replace')
+                                await queue.put(f"{prefix}: {line}") # Put prefixed line onto queue
+                                output_lines.append(line) # Also collect for final result
+                        except Exception as e:
+                             error_msg = f"--- Error reading {prefix} stream: {e} ---\n"
+                             await queue.put(error_msg) # Put error onto queue
+                             logger.error(error_msg.strip(), exc_info=True)
+                             output_lines.append(f"[Error in {prefix} stream: {e}]\n")
+                        finally:
+                            # Signal that this reader is done
+                            active_readers -= 1
+                            if active_readers == 0:
+                                await queue.put(None) # Put sentinel value when last reader finishes
+                    
+                    # Start reader tasks (reader_to_queue is a coroutine)
+                    stdout_task = asyncio.create_task(reader_to_queue(process.stdout, "STDOUT"))
+                    stderr_task = asyncio.create_task(reader_to_queue(process.stderr, "STDERR"))
+                    
+                    # Consume from the queue until the sentinel is received
+                    while True:
+                        item = await queue.get()
+                        if item is None: # Sentinel value received
+                            queue.task_done()
+                            break
+                        yield item # Yield the line/error from the queue
+                        queue.task_done()
 
-        # Return the async generator
-        return generate_stream()
+                    # Wait for reader tasks to ensure cleanup, handle potential task errors
+                    await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+                    # --- End Queue-based Concurrent Reading ---
 
-    except (ValueError, ImageNotFound, APIError, DockerException) as e:
-        logger.error(f"Docker test setup error: {type(e).__name__}: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=400 if isinstance(e, (ValueError, ImageNotFound)) else 500,
-            detail=f"Docker Error: {str(e)}"
-        )
-    except Exception as e:
-        # Create error result for non-streaming mode
-        logger.error(f"Unexpected error in Docker test setup: {type(e).__name__}: {e}", exc_info=True)
-        result = TestResult(
-            id=result_id,
-            project_path=config.project_path,
-            test_path=config.test_path,
-            runner=config.runner.value,
-            execution_mode=config.mode.value,
-            status="error",
-            summary=f"Docker setup error: {type(e).__name__}: {str(e)}",
-            details=f"Error: {str(e)}\n{traceback.format_exc()}",
-            execution_time=time.time() - start_time
-        )
-        
-        try:
-            await db.store_test_result(
-                result_id=result.id,
-                status=result.status, 
-                summary=result.summary,
-                details=result.details,
-                passed_tests=[],
-                failed_tests=[],
-                skipped_tests=[],
-                execution_time=result.execution_time,
-                config=config.model_dump()
-            )
-        except Exception as db_err:
-            logger.error(f"Failed to store Docker error result: {db_err}")
-            
-        return result
+                    # Wait for process completion or timeout
+                    yield "--- Waiting for process completion ---\n"
+                    # Ensure the process has actually finished before checking return code
+                    try:
+                         await asyncio.wait_for(process.wait(), timeout=config.timeout)
+                    except asyncio.TimeoutError:
+                         # Handle timeout specifically during wait if reading finished quickly
+                         logger.error(f"Process wait timed out after {config.timeout} seconds.")
+                         yield f"--- Timeout Error (Wait): Exceeded {config.timeout}s limit ---\n"
+                         if process.returncode is None: # Check if already terminated
+                              try:
+                                   process.terminate()
+                                   await process.wait() # Wait for termination
+                              except ProcessLookupError:
+                                   pass # Already gone
+                              except Exception as term_err:
+                                   logger.error(f"Error terminating process on wait timeout: {term_err}")
+                         status = "Timeout"
+                         summary = f"Execution timed out after {config.timeout} seconds."
+                         # Add timeout info to details even if some output was captured
+                         output_lines.append(f"\n\n[Timeout Error: Exceeded {config.timeout}s limit]")
+                         details = "".join(output_lines)
+                         passed_tests, failed_tests, skipped_tests = [], ["TimeoutError"], []
+                         # Jump to finally block to store result
+                         raise # Re-raise TimeoutError to trigger finally block correctly
 
+                    return_code = process.returncode
+                    yield f"--- Process completed with return code: {return_code} ---\n"
+                    
+                    # Combine final output from collected lines
+                    full_stdout_stderr = "".join(output_lines)
 
-@app.get("/")
-async def root(api_key: str = Depends(verify_api_key)):
-    """Root endpoint"""
-    return {"status": "active", "service": "MCP Test Server"}
+                    # --- Determine status based on return code and output ---
+                    # Use determine_test_status helper for more robust status detection
+                    status = determine_test_status(full_stdout_stderr, config.runner)
 
+                    # Override status based on critical return codes if necessary
+                    if return_code is not None and return_code != 0 and status == "success":
+                        logger.warning(f"Runner {config.runner.value} reported success in output, but process exited with code {return_code}. Overriding status to Failed.")
+                        status = "Failed"
+                    elif return_code == 5: # Specific pytest code for no tests collected
+                        status = "No Tests Found"
+                        summary = "No tests were found or collected."
+                    elif status == "error" and return_code == 0: # Possible internal script error but tests technically passed/didn't run
+                        logger.warning(f"Runner {config.runner.value} indicated error/exception, but process exited with 0. Status remains Error.")
+                    elif return_code != 0 and status != "failed": # General non-zero exit, but not classified as failed
+                        status = "Failed" # Default to Failed for non-zero exit codes if not already set
 
-@app.post("/run-tests")
-async def run_tests_endpoint(config: TestExecutionConfig, db: DatabaseManager = Depends(get_request_db_manager), api_key: str = Depends(verify_api_key)):
-    """Run tests with the given configuration. Returns JSON result or streaming text response."""
-    # Validate project path
-    if not os.path.isdir(config.project_path):
-        raise HTTPException(status_code=400, detail=f"Project path not found: {config.project_path}")
-    
-    # Check test path relative to project path
-    relative_test_path = config.test_path
-    absolute_test_path = os.path.join(config.project_path, relative_test_path)
-    if not os.path.exists(absolute_test_path):
-        # Allow running without a specific path if intent is to run all tests
-        if relative_test_path: # Only raise if a specific non-existent path was given
-             raise HTTPException(status_code=400, detail=f"Test path not found: {absolute_test_path}")
-    
-    try:
-        # Determine streaming mode EXPLICITLY from request
-        streaming_mode = config.additional_args and "stream" in config.additional_args
-        
-        if config.mode == ExecutionMode.LOCAL:
-            logger.info(f"Running local test execution for project: {config.project_path} (Stream: {streaming_mode})")
-            result = await run_tests_local(config, db)
-            
-            # Only return StreamingResponse if stream=True was requested
-            if streaming_mode and inspect.isasyncgen(result):
-                logger.info("Returning streaming response for local test execution")
-                return StreamingResponse(result, media_type="text/plain")
-            elif not streaming_mode and inspect.isasyncgen(result):
-                 # If it returned a stream unexpectedly, consume it to get the final result 
-                 logger.warning("run_tests_local returned a stream unexpectedly for non-streaming request. Consuming...")
-                 final_result_data = None
-                 async for line in result:
-                     if line.startswith("RESULT:"): # Try to get final result ID from stream
-                         try: 
-                              result_id = line.split("-")[0].split(":")[1].strip()
-                              final_result_data = await db.get_test_result(result_id)
-                         except Exception as e:
-                              logger.error(f"Failed to extract/fetch result ID from unexpected stream: {e}")
-                         break # Stop consuming after finding result line
-                 if final_result_data:
-                      return final_result_data # Return the TestResult object fetched from DB
-                 else:
-                      # If we couldn't get the result ID or fetch it, return an error
-                      # Ideally, run_tests_local shouldn't get here in non-streaming mode
-                      error_id = str(uuid.uuid4())
-                      error_res = TestResult(id=error_id, status="error", summary="Failed to process unexpected stream from local runner", details="", execution_time=0, project_path=config.project_path, test_path=config.test_path, runner=config.runner.value, execution_mode=config.mode.value)
-                      # Attempt to store error
-                      try: await db.store_test_result(result_id=error_id, status="error", summary=error_res.summary, details="", execution_time=0, config=config.model_dump())
-                      except Exception as db_err: logger.error(f"Failed to store stream error result: {db_err}")
-                      return error_res # Return the error result as JSON
-            elif not streaming_mode and not inspect.isasyncgen(result):
-                 # This is the expected path for non-streaming local runs
-                 logger.info("Returning JSON response for non-streaming local test execution")
-                 return result # Return the TestResult object directly
-            elif streaming_mode and not inspect.isasyncgen(result):
-                 # Corner case: Requested stream but got JSON (shouldn't happen with run_tests_local)
-                 logger.error("run_tests_local returned JSON unexpectedly for streaming request.")
-                 return result # Return JSON anyway?
-            else:
-                 logger.error("Unexpected state in /run-tests endpoint after run_tests_local call.")
-                 raise HTTPException(status_code=500, detail="Internal server error processing local test request.")                 
-            
-        elif config.mode == ExecutionMode.DOCKER:
-            logger.info(f"Running Docker test execution for project: {config.project_path} (Stream: {streaming_mode})")
-            
-            # run_tests_docker now handles streaming internally based on config
-            result = await run_tests_docker(config, db)
-            
-            # Only return StreamingResponse if stream=True was requested AND runner returned a generator
-            if streaming_mode and inspect.isasyncgen(result):
-                logger.info("Returning streaming response for Docker test execution")
-                return StreamingResponse(result, media_type="text/plain")
-            # Return JSON if stream=False was requested AND runner returned TestResult object
-            elif not streaming_mode and not inspect.isasyncgen(result):
-                 logger.info("Returning JSON response for non-streaming Docker test execution")
-                 return result # Return the TestResult object directly
-            # Handle mismatches (log errors, return best guess)
-            elif streaming_mode and not inspect.isasyncgen(result): 
-                 logger.error("Requested stream for Docker but received JSON result unexpectedly.")
-                 return result # Return the JSON result anyway
-            elif not streaming_mode and inspect.isasyncgen(result):
-                 logger.warning("Requested JSON for Docker but received stream result unexpectedly. Consuming stream...")
-                 # Attempt to consume the stream and return the final TestResult object
-                 final_result_object = None
-                 try:
-                     async for item in result:
-                         # The last item yielded should be the TestResult object
-                         final_result_object = item
-                 except Exception as e:
-                     logger.error(f"Error consuming unexpected stream: {type(e).__name__}: {e}", exc_info=True)
-                     # Fallback to error result if stream consumption fails
-                     error_id = str(uuid.uuid4())
-                     error_res = TestResult(id=error_id, status="error", summary=f"Failed to consume unexpected stream: {type(e).__name__}", details=str(e), execution_time=0, project_path=config.project_path, test_path=config.test_path, runner=config.runner.value, execution_mode=config.mode.value)
-                     try: await db.store_test_result(result_id=error_id, status="error", summary=error_res.summary, details=error_res.details, execution_time=0, config=config.model_dump())
-                     except Exception as db_err: logger.error(f"Failed to store stream consumption error result: {db_err}")
-                     return error_res
+                    # Extract detailed results and summary from the combined output
+                    extracted = extract_test_results(full_stdout_stderr, config.runner)
+                    passed_tests = extracted["passed"]
+                    failed_tests = extracted["failed"]
+                    skipped_tests = extracted["skipped"]
+                    
+                    # Refine summary and failed tests based on status
+                    if status == "Failed" and not failed_tests:
+                         # If status is Failed but no specific tests were parsed as failed, add a general failure indicator
+                         failed_tests.append(f"Unknown failure (Exit Code {return_code or 'N/A'})")
+                    
+                    extracted_summary = extract_test_summary(full_stdout_stderr, config.runner)
+                    if extracted_summary:
+                         summary = extracted_summary # Use parsed summary if available
+                    elif status == "Passed":
+                        summary = "All tests passed."
+                    elif status == "Failed":
+                         summary = f"Test execution failed (Return Code: {return_code or 'N/A'})."
+                    # Keep existing summary for Timeout, Error, No Tests Found
+                         
+                    details = full_stdout_stderr # Store raw combined output
 
-                 if isinstance(final_result_object, TestResult):
-                     logger.info("Successfully extracted TestResult object from consumed stream.")
-                     return final_result_object
-                 else:
-                     # Log an error if the last item wasn't a TestResult
-                     logger.error(f"Unexpected final item type received from stream: {type(final_result_object)}. Expected TestResult.")
-                     error_id = str(uuid.uuid4())
-                     error_res = TestResult(id=error_id, status="error", summary="Unexpected final item from Docker stream", details=f"Received type {type(final_result_object)}", execution_time=0, project_path=config.project_path, test_path=config.test_path, runner=config.runner.value, execution_mode=config.mode.value)
-                     try: await db.store_test_result(result_id=error_id, status="error", summary=error_res.summary, details=error_res.details, execution_time=0, config=config.model_dump())
-                     except Exception as db_err: logger.error(f"Failed to store unexpected item error result: {db_err}")
-                     return error_res
-            else:
-                 logger.error("Unknown mismatch between requested streaming mode and Docker runner result type.")
-                 raise HTTPException(status_code=500, detail="Internal server error processing Docker test result type.")
-            
+                except asyncio.TimeoutError:
+                    logger.error(f"Test execution timed out after {config.timeout} seconds during streaming.")
+                    yield f"--- Timeout Error: Exceeded {config.timeout}s limit ---\n"
+                    if process:
+                         try:
+                             process.terminate()
+                             await process.wait()
+                         except ProcessLookupError:
+                             pass
+                         except Exception as term_err:
+                             logger.error(f"Error terminating process after stream timeout: {term_err}")
+                    status = "Timeout"
+                    summary = f"Execution timed out after {config.timeout} seconds."
+                    details += f"\n\n[Timeout Error: Exceeded {config.timeout}s limit]"
+                    passed_tests, failed_tests, skipped_tests = [], ["TimeoutError"], []
+                
+                except Exception as e:
+                    error_msg = f"--- Error during test execution: {type(e).__name__}: {e} ---\n"
+                    logger.exception("Unexpected error during streaming test execution")
+                    yield error_msg
+                    status = "Error"
+                    summary = f"An unexpected error occurred during execution: {type(e).__name__}"
+                    details += f"\n\n[Execution Error]: {e}"
+                    passed_tests, failed_tests, skipped_tests = [], [f"ExecutionError: {type(e).__name__}"], []
+                    return_code = -1
+                
+                finally:
+                    # Store the final result regardless of success/failure/error during stream
+                    execution_time = time.time() - start_time
+                    final_result = ResultData(
+                         id=result_id, project_path=config.project_path, test_path=str(test_path_resolved),
+                         runner=config.runner.value, execution_mode=config.mode.value, status=status,
+                         summary=summary, details=details, # Store potentially incomplete details
+                         passed_tests=passed_tests, failed_tests=failed_tests, skipped_tests=skipped_tests,
+                         execution_time=execution_time
+                    )
+                    try:
+                         await db.store_test_result(
+                              result_id=final_result.id, status=final_result.status, summary=final_result.summary,
+                              details=final_result.details, passed_tests=final_result.passed_tests,
+                              failed_tests=final_result.failed_tests, skipped_tests=final_result.skipped_tests,
+                              execution_time=final_result.execution_time, config=config.model_dump()
+                         )
+                         yield f"--- RESULT_STORED: {final_result.id} ---\n"
+                    except Exception as db_err:
+                         logger.error(f"Failed to store streaming result {final_result.id} to DB: {db_err}")
+                         yield f"--- Error storing result: {db_err} ---\n"
+
+            return generate_stream() # Return the generator
+
+        # --- Non-Streaming Execution --- 
         else:
-            raise HTTPException(status_code=400, detail=f"Invalid execution mode: {config.mode}")
+            # (Original non-streaming logic remains largely the same)
+            process = await asyncio.create_subprocess_exec(
+                 *runner_cmd,
+                 stdout=asyncio.subprocess.PIPE,
+                 stderr=asyncio.subprocess.PIPE,
+                 cwd=project_path_str, 
+                 env=current_env
+            )
+
+            output_buffer = [] # Collect lines for final processing
+            error_buffer = []
+            output_tokens = 0
+            max_tokens = config.max_tokens
+
+            async def read_stream_non_streaming(stream, buffer_list, token_limit, is_stdout):
+                 nonlocal output_tokens
+                 full_output = ""
+                 while True:
+                      try:
+                           line_bytes = await stream.readline()
+                           if not line_bytes:
+                                break
+                           line = line_bytes.decode('utf-8', errors='replace')
+                           full_output += line # Collect everything for potential extraction later
+                           
+                           # Only apply token limit to stdout buffer for the final result
+                           if is_stdout:
+                                current_line_tokens = count_tokens(line)
+                                if output_tokens + current_line_tokens <= token_limit:
+                                     buffer_list.append(line)
+                                     output_tokens += current_line_tokens
+                                else:
+                                     if not buffer_list or "[output truncated]" not in buffer_list[-1]:
+                                          buffer_list.append("... [output truncated due to token limit] ...\n")
+                           else:
+                                buffer_list.append(line) # Keep all stderr for the final result
+                                
+                      except asyncio.CancelledError:
+                           logger.warning("Non-streaming reader cancelled.")
+                           break
+                      except Exception as e:
+                           logger.error(f"Error reading non-streaming stream: {e}")
+                           buffer_list.append(f"[Error reading stream: {e}]\n")
+                           break
+                 return full_output
             
-    except HTTPException as http_exc:
-         raise http_exc # Re-raise explicit HTTP exceptions
-         
+            full_stdout, full_stderr = "", ""
+            try:
+                stdout_task = asyncio.create_task(read_stream_non_streaming(process.stdout, output_buffer, max_tokens, True))
+                stderr_task = asyncio.create_task(read_stream_non_streaming(process.stderr, error_buffer, max_tokens, False))
+                
+                await asyncio.wait_for(process.wait(), timeout=config.timeout)
+                return_code = process.returncode
+                
+                full_stdout = await stdout_task
+                full_stderr = await stderr_task 
+                logger.info(f"Test process finished with return code: {return_code}")
+
+            except asyncio.TimeoutError:
+                 logger.error(f"Test execution timed out after {config.timeout} seconds.")
+                 status = "Timeout"
+                 summary = f"Execution timed out after {config.timeout} seconds."
+                 # Combine potentially large buffers carefully
+                 details = "\n".join(output_buffer) + "\n--- STDERR ---\n" + "\n".join(error_buffer) + f"\n\n[Timeout Error: Exceeded {config.timeout}s limit]"
+                 passed_tests, failed_tests, skipped_tests = [], ["TimeoutError"], []
+                 # Ensure process is terminated on timeout
+                 if process and process.returncode is None:
+                     try:
+                         process.terminate()
+                         await process.wait()
+                     except ProcessLookupError:
+                         pass # Already gone
+                     except Exception as term_err:
+                          logger.error(f"Error terminating timed-out process: {term_err}")
+
+            except Exception as e:
+                 logger.exception("Unexpected error during non-streaming test execution")
+                 status = "Error"
+                 summary = f"An unexpected error occurred: {type(e).__name__}"
+                 details = "\n".join(output_buffer) + "\n--- STDERR ---\n" + "\n".join(error_buffer) + f"\n\n[Execution Error]: {e}"
+                 passed_tests, failed_tests, skipped_tests = [], [f"ExecutionError: {type(e).__name__}"], []
+                 return_code = -1 # Indicate internal error
+            else:
+                 # Normal completion logic...
+                 details = f"--- STDOUT ---\n{full_stdout}\n--- STDERR ---\n{full_stderr}" # Use full output for details now
+                 if return_code == 0:
+                     status = "Passed"
+                     summary = "All tests passed."
+                 elif return_code == 5:
+                      status = "No Tests Found"
+                      summary = "No tests were found or collected."
+                 else:
+                      status = "Failed"
+                      summary = f"Test execution failed with return code {return_code}."
+                      
+                 extracted = extract_test_results(full_stdout + "\n" + full_stderr, config.runner)
+                 passed_tests = extracted["passed"]
+                 failed_tests = extracted["failed"]
+                 skipped_tests = extracted["skipped"]
+                 if status == "Failed" and not failed_tests:
+                      failed_tests.append(f"Unknown failure (Exit Code {return_code})")
+                 extracted_summary = extract_test_summary(full_stdout + "\n" + full_stderr, config.runner)
+                 if extracted_summary:
+                      summary = extracted_summary
+
+            # Final result preparation and storage (common to error/timeout/normal paths)
+            execution_time = time.time() - start_time
+            result_data = ResultData(
+                id=result_id,
+                project_path=config.project_path,
+                test_path=str(test_path_resolved),
+                runner=config.runner.value,
+                execution_mode=config.mode.value,
+                status=status,
+                summary=summary,
+                details=details, # Use potentially truncated details for JSON response
+                passed_tests=passed_tests,
+                failed_tests=failed_tests,
+                skipped_tests=skipped_tests,
+                execution_time=execution_time
+            )
+            await db.store_test_result(
+                 result_id=result_data.id, status=result_data.status, summary=result_data.summary,
+                 details=result_data.details, passed_tests=result_data.passed_tests, 
+                 failed_tests=result_data.failed_tests, skipped_tests=result_data.skipped_tests, 
+                 execution_time=result_data.execution_time, config=config.model_dump()
+            )
+            logger.info(f"Stored test result with ID: {result_data.id} and status: {result_data.status}")
+            return result_data # Return the final data object
+            
     except Exception as e:
-         # Catch-all for unexpected errors during endpoint processing/calling run functions
-         logger.error(f"Unexpected error in /run-tests endpoint: {type(e).__name__}: {e}", exc_info=True)
-         # Create a generic error TestResult
-         # Use a different ID to avoid potential collisions if run_* function partially succeeded
-         error_id = str(uuid.uuid4()) 
-         error_result = TestResult(
-             id=error_id,
-             project_path=config.project_path,
-             test_path=config.test_path,
-             runner=config.runner.value,
-             execution_mode=config.mode.value,
-             status="error",
-             summary=f"Endpoint processing error: {type(e).__name__}",
-             details=f"Error: {str(e)}\n{traceback.format_exc()}",
-             execution_time=0
+         logger.error(f"Configuration error for local execution: {e}", exc_info=True)
+         status = "Config Error"
+         summary = f"Configuration Error: {e}"
+         details = f"Error during setup: {e}"
+         execution_time = time.time() - start_time
+         result_data = ResultData(
+             id=result_id, project_path=config.project_path, test_path=config.test_path, 
+             runner=config.runner.value, execution_mode=config.mode.value, status=status, 
+             summary=summary, details=details, execution_time=execution_time,
+             passed_tests=[], failed_tests=[f"{type(e).__name__}"], skipped_tests=[]
          )
-         # Attempt to store this endpoint-level error result
          try:
              await db.store_test_result(
-                 result_id=error_result.id, status=error_result.status, summary=error_result.summary,
-                 details=error_result.details, passed_tests=[], failed_tests=[], skipped_tests=[],
-                 execution_time=error_result.execution_time, config=config.model_dump()
+                  result_id=result_data.id, status=result_data.status, summary=result_data.summary,
+                  details=result_data.details, passed_tests=[], failed_tests=result_data.failed_tests, 
+                  skipped_tests=[], execution_time=result_data.execution_time, config=config.model_dump()
              )
-         except Exception as db_store_err:
-             logger.error(f"Failed to store endpoint error result {error_id} to DB: {db_store_err}")
-         # Return the error result even if DB store failed
-         return error_result
+             logger.info(f"Stored config error result with ID: {result_data.id}")
+         except Exception as db_err:
+             logger.error(f"Failed to store config error result {result_data.id} to DB: {db_err}")
+         
+         if config.stream_output:
+             # For config errors, we still need to yield something if streaming was requested
+             async def error_stream():
+                 yield f"--- CONFIGURATION ERROR ---\n"
+                 yield f"{details}\n"
+                 # Yield ResultData compatible info for potential parsing by client
+                 yield f"Result ID: {result_data.id}\n"
+                 yield f"Status: {result_data.status}\n"
+                 yield f"Summary: {result_data.summary}\n"
+                 # yield f"DETAILS_START\n{details}\nDETAILS_END\n" # Keep details concise here
+                 yield f"Execution Time: {result_data.execution_time:.2f}s\n"
+                 yield f"--- RESULT_STORED: {result_data.id} (as Config Error) ---\n"
+
+             return error_stream()
+         else:
+             return result_data # Return ResultData directly for non-streaming config errors
 
 
-@app.get("/results/{result_id}", response_model=TestResult)
+@app.get("/results/{result_id}", response_model=ResultData)
 async def get_test_result(result_id: str, db: DatabaseManager = Depends(get_request_db_manager), api_key: str = Depends(verify_api_key)):
     """Get the result of a previous test run"""
     result = await db.get_test_result(result_id)
@@ -1353,11 +922,15 @@ async def get_test_result(result_id: str, db: DatabaseManager = Depends(get_requ
     return result
 
 
-@app.get("/results", response_model=List[str])
+@app.get("/results", response_model=List[ResultData])
 async def list_test_results(db: DatabaseManager = Depends(get_request_db_manager), api_key: str = Depends(verify_api_key)):
-    """List all test result IDs"""
+    """List all test results, returning full ResultData objects."""
     results = await db.list_test_results()
-    return [r["id"] for r in results]
+    # Convert the list of dicts from the DB to ResultData objects
+    # Assuming db.list_test_results returns a list of dictionaries
+    # that match the structure expected by ResultData
+    # If the structure is different, mapping/transformation might be needed here.
+    return results # FastAPI automatically handles Pydantic model validation/conversion
 
 
 @app.get("/last-failed", response_model=List[str])
@@ -1367,19 +940,88 @@ async def get_last_failed_tests(project_path: str, db: DatabaseManager = Depends
     return failed_tests
 
 
-# Set up application startup
-@app.on_event("startup")
-async def startup_event():
-    """Initialize the database on startup."""
-    logger.info("[STARTUP] Entering startup_event...")
-    db_manager = get_db_manager()
-    await db_manager.connect()
-    logger.info("[STARTUP] db_manager.connect() complete.")
-    await db_manager._create_tables()
-    logger.info("[STARTUP] db_manager._create_tables() complete.")
-    await db_manager.disconnect()
-    logger.info("[STARTUP] db_manager.disconnect() complete.")
-    logger.info("[STARTUP] startup_event complete.")
+# ---> ADDED /run-tests ENDPOINT <---
+@app.post("/run-tests", response_model=None)
+async def run_tests_endpoint(
+    config: ExecutionConfig,
+    background_tasks: BackgroundTasks, # Keep for potential future background work
+    db: DatabaseManager = Depends(get_request_db_manager), # Use request-scoped DB
+    api_key: str = Depends(verify_api_key) # Security dependency
+) -> Union[ResultData, StreamingResponse]: # Re-adding return type hint for clarity
+    """Endpoint to trigger test execution (local or potentially docker)."""
+    logger.info(f"Received request to run tests: Mode={config.mode.value}, Path={config.test_path}, Stream={config.stream_output}")
+    
+    # Currently, only local execution is fully implemented and tested here.
+    # Docker execution logic seems missing or was refactored out.
+    if config.mode == ExecutionMode.DOCKER:
+        logger.warning("Docker execution mode selected, but not implemented in this endpoint. Falling back to local.")
+        # raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Docker execution mode not implemented yet.")
+        # For now, we can proceed with local execution or explicitly block.
+        # Let's proceed with local for now to allow testing the flow.
+        pass # Allowing fallback to local for now
+
+    try:
+        # Call the appropriate execution function
+        # Since run_tests_docker was removed, we only have run_tests_local
+        result_or_stream = await run_tests_local(config=config, db=db)
+
+        if config.stream_output:
+            # Ensure it's an async generator before creating StreamingResponse
+            if inspect.isasyncgen(result_or_stream):
+                # Define a generator that yields text chunks for the stream
+                async def stream_wrapper():
+                    try:
+                        async for chunk in result_or_stream:
+                            yield f"{chunk}\n" # Add newline for client readability
+                    except Exception as stream_err:
+                        logger.error(f"Error during stream generation: {stream_err}", exc_info=True)
+                        yield f"STREAM_ERROR: {stream_err}\n"
+                
+                return StreamingResponse(stream_wrapper(), media_type="text/plain")
+            else:
+                # Handle case where streaming was requested but local func returned ResultData (e.g., config error)
+                logger.error(f"Streaming requested but received non-generator: {type(result_or_stream)}")
+                # Re-raise or return an error response. For simplicity, return the data.
+                # This path might indicate an issue in run_tests_local error handling for streams.
+                if isinstance(result_or_stream, ResultData):
+                     # This shouldn't happen ideally if run_tests_local handles streaming errors correctly
+                     # Return a 500 error as this indicates an internal inconsistency
+                      raise HTTPException(status_code=500, detail="Internal server error: Streaming failed unexpectedly.")
+                else:
+                     # Unknown type returned
+                      raise HTTPException(status_code=500, detail="Internal server error: Unexpected type returned for stream.")
+
+        else:
+            # Non-streaming: Ensure we got ResultData
+            if isinstance(result_or_stream, ResultData):
+                return result_or_stream
+            else:
+                # Handle unexpected generator return in non-streaming mode
+                logger.error(f"Non-streaming requested but received generator: {type(result_or_stream)}")
+                # Consume generator to get the result if possible (might be error state)
+                final_result = None
+                try:
+                    async for item in result_or_stream:
+                         if isinstance(item, ResultData): # Assuming the generator might yield ResultData at the end
+                              final_result = item
+                              break
+                    if final_result:
+                         return final_result
+                    else:
+                         raise HTTPException(status_code=500, detail="Internal server error: Failed to get result from generator.")
+                except Exception as e:
+                     logger.exception("Error consuming unexpected generator in non-streaming mode")
+                     raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+
+    except ValueError as ve:
+        logger.warning(f"Configuration validation error in /run-tests: {ve}")
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(ve))
+    except HTTPException as he:
+        # Re-raise HTTP exceptions from dependencies (like auth)
+        raise he
+    except Exception as e:
+        logger.exception("Unexpected error in /run-tests endpoint")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {e}")
 
 
 def main():

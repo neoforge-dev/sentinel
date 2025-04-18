@@ -17,10 +17,20 @@ from src.mcp_enhanced_agent import MCPEnhancedAgent
 # Add project root to path to allow importing server modules if needed
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-# Define server URLs and API Key
+# Define server URLs, Port, and API Key
 CODE_SERVER_URL = "http://localhost:8083" # Using 8083 for test code server
-TEST_SERVER_URL = "http://localhost:8082"
+TEST_SERVER_PORT = 8082 # Define the port
+TEST_SERVER_URL = f"http://localhost:{TEST_SERVER_PORT}"
 API_KEY = os.environ.get("MCP_API_KEY", "dev_secret_key")
+
+# Define a module-scoped event loop specifically for conftest managed fixtures
+# This is needed by the session-scoped server process fixtures.
+# @pytest.fixture(scope="session") # Removed custom event_loop fixture
+# def event_loop(request):
+#     """Create an instance of the default event loop for the session."""
+#     loop = asyncio.get_event_loop_policy().new_event_loop()
+#     yield loop
+#     loop.close()
 
 @pytest.fixture(scope="session", autouse=True)
 def initialize_test_database():
@@ -72,7 +82,7 @@ def sample_project_path(tmp_path_factory):
     return base_temp 
 
 @pytest.fixture(scope="session")
-def code_server_process() -> subprocess.Popen: # Yield only process again
+def code_server_process(): # Removed event_loop dependency
     """Starts the MCP Code Server on a fixed port (8083) for integration tests."""
     env = os.environ.copy()
     env["MCP_API_KEY"] = API_KEY
@@ -140,7 +150,7 @@ def code_server_process() -> subprocess.Popen: # Yield only process again
         print("Code Server killed.")
 
 @pytest.fixture(scope="session")
-def test_server_process():
+def test_server_process(): # Removed event_loop dependency
     """Starts the MCP Test Server as a background process, ensuring it's ready."""
     env = os.environ.copy()
     env["MCP_API_KEY"] = API_KEY

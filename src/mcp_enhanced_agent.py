@@ -35,93 +35,100 @@ class MCPEnhancedAgent:
         code_server_url: str = "http://localhost:8000",
         test_server_url: str = "http://localhost:8082",
         api_key: Optional[str] = None,
-        session: Optional[aiohttp.ClientSession] = None
+        session: Optional[aiohttp.ClientSession] = None,
+        retry_attempts: int = 3,
+        retry_delay: float = 1.0
     ):
         """Initialize the agent with server URLs and optional session."""
-        self.code_server_url = code_server_url
-        self.test_server_url = test_server_url
+        self.code_server_url = code_server_url.rstrip('/')
+        self.test_server_url = test_server_url.rstrip('/')
         self.api_key = api_key
-        self.default_headers = {'Content-Type': 'application/json'} # Initialize default headers
-        
-        if session:
-            self.session = session
-            self._owns_session = False
-            logger.info("Using provided aiohttp ClientSession.")
-        else:
-            # Create a default session if none is provided
-            self.session = aiohttp.ClientSession()
-            self._owns_session = True
-            logger.info("Created internal aiohttp ClientSession.")
-            
+        # Use provided session or create a new one if None
+        self._session_owner = session is None
+        self.session = session if session else aiohttp.ClientSession()
+        self.retry_attempts = retry_attempts
+        self.retry_delay = retry_delay
         logger.info(f"Initialized MCPEnhancedAgent with code server at {self.code_server_url} and test server at {self.test_server_url}")
     
     async def close(self):
         """Closes the internally managed session, if it exists and is owned by the agent."""
-        if self.session and self._owns_session:
+        if self.session and self._session_owner:
             await self.session.close()
             self.session = None
-            self._owns_session = False
+            self._session_owner = False
             logger.info("Closed internally owned aiohttp ClientSession.")
-        elif not self._owns_session:
+        elif not self._session_owner:
             logger.debug("Agent does not own the session, not closing it.")
         else:
             logger.debug("No active session to close.")
     
-    async def _make_request(self, method: str, url: str, **kwargs) -> Dict[str, Any]:
-        """Makes an async HTTP request and handles common responses."""
-        headers = self.default_headers.copy()
-        if self.api_key:
-            headers['X-API-Key'] = self.api_key
+    async def _make_request(self, method: str, server_type: str, endpoint: str, **kwargs) -> Dict[str, Any]:
+        base_url = self.code_server_url if server_type == "code" else self.test_server_url
+        url = f"{base_url}/{endpoint.lstrip('/')}"
+        headers = kwargs.pop("headers", {})
+        headers["X-API-Key"] = self.api_key
         
-        request_kwargs = {"headers": headers, **kwargs}
-        
-        try:
-            async with self.session.request(method, url, **request_kwargs) as response:
-                # Try to parse JSON regardless of status code initially
-                try:
-                    json_data = await response.json()
-                except (aiohttp.ContentTypeError, json.JSONDecodeError):
-                    # If JSON parsing fails, read text and store it
-                    text_data = await response.text()
-                    json_data = {"error": "Failed to decode JSON", "status_code": response.status, "text": text_data}
+        request_kwargs = {
+            "headers": headers,
+            "timeout": aiohttp.ClientTimeout(total=60) # Add a default timeout
+        }
+        if method.upper() == "POST" and "json" in kwargs:
+             request_kwargs["json"] = kwargs["json"]
+             
+        current_attempt = 0
+        while current_attempt < self.retry_attempts:
+            current_attempt += 1
+            try:
+                async with self.session.request(method, url, **request_kwargs) as response:
+                    try:
+                         response_data = await response.json()
+                         # Return a dictionary including status code and data
+                         return {"status_code": response.status, **response_data}
+                    except (aiohttp.ContentTypeError, json.JSONDecodeError):
+                         # Handle non-JSON responses or empty bodies
+                         response_text = await response.text()
+                         logger.warning(f"Non-JSON response received from {url} (Status: {response.status}). Body: {response_text[:100]}...")
+                         return {"status_code": response.status, "detail": response_text}
+                         
+            except aiohttp.ClientConnectorError as e:
+                 logger.error(f"Connection error during {method} request to {url} (Attempt {current_attempt}): {e}")
+                 if current_attempt == self.retry_attempts:
+                      return {"status_code": 503, "error": "Service Unavailable", "detail": str(e)}
+            except asyncio.TimeoutError as e:
+                 logger.error(f"Timeout during {method} request to {url} (Attempt {current_attempt})")
+                 if current_attempt == self.retry_attempts:
+                      return {"status_code": 504, "error": "Gateway Timeout", "detail": "Request timed out"}
+            except aiohttp.ClientResponseError as e:
+                 logger.error(f"HTTP error during {method} request to {url} (Attempt {current_attempt}): {e.status} {e.message}")
+                 # Return status code from the error
+                 return {"status_code": e.status, "error": e.message, "detail": str(e)}
+            except Exception as e:
+                 logger.exception(f"Unexpected error during {method} request to {url} (Attempt {current_attempt}): {e}")
+                 if current_attempt == self.retry_attempts:
+                     # Return a generic 500 error for unexpected issues
+                      return {"status_code": 500, "error": "Internal Server Error", "detail": str(e)}
+            
+            # Wait before retrying if not the last attempt
+            if current_attempt < self.retry_attempts:
+                await asyncio.sleep(self.retry_delay)
 
-                # Combine status code with JSON data (or error data)
-                result_data = {"status_code": response.status, **json_data}
-                
-                # Log non-2xx responses
-                if not 200 <= response.status < 300:
-                    logger.error(f"HTTP error: {response.status} {response.reason} for {method} {url}. Response: {result_data}")
-                    # Optionally raise an exception here for critical errors, 
-                    # but for now, returning the data allows calling methods to decide.
-
-                return result_data
-        except aiohttp.ClientError as e:
-            logger.error(f"HTTP client error when making {method} request to {url}: {e}")
-            return {"status_code": 503, "error": f"HTTP client error: {e}"} # 503 Service Unavailable
-        except Exception as e:
-            logger.error(f"Unexpected error during {method} request to {url}: {e}", exc_info=True)
-            return {"status_code": 500, "error": f"Unexpected agent error: {e}"}
+        # This part should ideally not be reached if retry logic is sound.
+        logger.error(f"Request failed after {self.retry_attempts} attempts for {url}")
+        return {"status_code": 500, "error": "Request Failed", "detail": f"Request failed after {self.retry_attempts} attempts."}
     
     # Code Server Methods
     
     async def analyze_code(self, code: str, language: str = "python") -> Dict[str, Any]:
         """Analyzes code using the code server."""
-        url = f"{self.code_server_url}/analyze"
-        payload = {"code": code, "language": language}
-        # _make_request now includes status_code and potential error fields
-        return await self._make_request("POST", url, json=payload)
+        return await self._make_request("POST", "code", "analyze", json={"code": code, "language": language})
     
     async def format_code(self, code: str, language: str = "python") -> Dict[str, Any]:
         """Formats code using the code server."""
-        url = f"{self.code_server_url}/format"
-        payload = {"code": code, "language": language}
-        return await self._make_request("POST", url, json=payload)
+        return await self._make_request("POST", "code", "format", json={"code": code, "language": language})
     
     async def analyze_and_fix_code(self, code: str, language: str = "python") -> Dict[str, Any]:
         """Fixes code using the code server."""
-        url = f"{self.code_server_url}/fix"
-        payload = {"code": code, "language": language}
-        return await self._make_request("POST", url, json=payload)
+        return await self._make_request("POST", "code", "fix", json={"code": code, "language": language})
     
     async def store_code_snippet(
         self, 
@@ -130,14 +137,11 @@ class MCPEnhancedAgent:
         metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """Stores a code snippet via the code server."""
-        url = f"{self.code_server_url}/snippets" # Corrected endpoint
-        payload = {"code": code, "language": language, "metadata": metadata or {}}
-        return await self._make_request("POST", url, json=payload)
+        return await self._make_request("POST", "code", "snippets", json={"code": code, "language": language, "metadata": metadata or {}})
     
     async def get_code_snippet(self, snippet_id: str) -> Dict[str, Any]:
         """Retrieves a code snippet from the code server."""
-        url = f"{self.code_server_url}/snippets/{snippet_id}" # Corrected endpoint
-        return await self._make_request("GET", url)
+        return await self._make_request("GET", "code", f"snippets/{snippet_id}")
     
     # Test Server Methods
     
@@ -155,26 +159,14 @@ class MCPEnhancedAgent:
         additional_args: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """Runs tests using the test server."""
-        url = f"{self.test_server_url}/run-tests"
-        payload = {
+        return await self._make_request("POST", "test", "run-tests", json={
             "project_path": project_path,
             "test_path": test_path,
             "runner": runner,
             "mode": mode,
             "timeout": timeout,
             "max_tokens": max_tokens
-        }
-        
-        if max_failures is not None:
-            payload["max_failures"] = max_failures
-        if run_last_failed:
-            payload["run_last_failed"] = run_last_failed
-        if docker_image:
-            payload["docker_image"] = docker_image
-        if additional_args:
-            payload["additional_args"] = additional_args
-            
-        return await self._make_request("POST", url, json=payload)
+        })
     
     async def run_and_analyze_tests(
         self,
@@ -259,8 +251,7 @@ class MCPEnhancedAgent:
         Returns:
             Dictionary with test results
         """
-        url = f"{self.test_server_url}/result/{result_id}"
-        return await self._make_request("GET", url)
+        return await self._make_request("GET", "test", f"result/{result_id}")
     
     async def list_test_results(self) -> List[str]:
         """
@@ -269,8 +260,7 @@ class MCPEnhancedAgent:
         Returns:
             List of test execution IDs
         """
-        url = f"{self.test_server_url}/results"
-        response = await self._make_request("GET", url)
+        response = await self._make_request("GET", "test", "results")
         return response.get("result_ids", [])
     
     async def get_last_failed_tests(self) -> List[str]:
@@ -280,8 +270,7 @@ class MCPEnhancedAgent:
         Returns:
             List of test names that failed
         """
-        url = f"{self.test_server_url}/failed"
-        response = await self._make_request("GET", url)
+        response = await self._make_request("GET", "test", "failed")
         return response.get("failed_tests", [])
 
     # --- Tool Management --- 

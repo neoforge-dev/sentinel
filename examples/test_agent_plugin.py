@@ -19,17 +19,25 @@ from enum import Enum
 from typing import Dict, List, Optional, Any, Union
 import asyncio
 import aiohttp
+import httpx
 
 # Get the MCP Test Server URL from environment or use default
 MCP_TEST_SERVER_URL = os.environ.get("MCP_TEST_SERVER_URL", "http://localhost:8082")
 API_KEY = os.environ.get("MCP_API_KEY", "test-key")  # Replace with your actual API key
 
+# Define the API key and base URL (adjust if necessary)
+AGENT_API_KEY = os.getenv("AGENT_API_KEY", "dev_secret_key")
 
-class TestRunner(str, Enum):
-    """Enumeration of test runners"""
+HEADERS = {"X-API-KEY": AGENT_API_KEY}
+
+# Replicate relevant enums/models from the server IF they are simple enough
+# For complex cases, consider a shared library or just using dicts
+
+# Renamed from TestRunner to avoid pytest collection warning
+class RunnerType(str, Enum):
     PYTEST = "pytest"
     UNITTEST = "unittest"
-    UV = "uv"
+    NOSE2 = "nose2"
 
 
 class ExecutionMode(str, Enum):
@@ -312,23 +320,49 @@ def register_test_tools(agent):
     )
 
 
-if __name__ == "__main__":
+async def main():
     # Example usage
-    import pprint
-    
-    # Run a test
-    result = run_tests(
-        project_path="/path/to/project",
-        test_path="tests",
-        runner="pytest",
-        max_failures=1
-    )
-    
-    # Print the result
-    print("\n===== TEST RESULT =====")
-    pprint.pprint(result)
-    
-    # Format the result
-    formatted = format_test_result_for_agent(result)
-    print("\n===== FORMATTED TEST RESULT =====")
-    print(formatted) 
+    project_path = "/Users/bogdan/til/test-project" # Use an absolute path to a test project
+    try:
+        # Example 1: Run specific pytest file locally, streaming
+        print("--- Running pytest locally (streaming) ---")
+        async for chunk in run_tests(
+            project_path=project_path,
+            test_path="tests/test_sample.py",
+            runner=RunnerType.PYTEST,
+            mode="local",
+            stream_output=True
+        ):
+            print(chunk, end="")
+        print("\n-----------------------------------------")
+
+        # Example 2: Run unittest tests using Docker, no streaming
+        print("--- Running unittest in Docker (no streaming) ---")
+        result = await run_tests(
+            project_path=project_path,
+            test_path="tests/test_another.py",
+            runner=RunnerType.UNITTEST,
+            mode="docker",
+            stream_output=False
+        )
+        print(json.dumps(result, indent=2))
+        print("-----------------------------------------")
+
+        # Example 3: Run nose2 tests locally
+        print("--- Running nose2 locally (no streaming) ---")
+        result = await run_tests(
+            project_path=project_path,
+            runner=RunnerType.NOSE2,
+            mode="local",
+            stream_output=False
+        )
+        print(json.dumps(result, indent=2))
+        print("-----------------------------------------")
+
+    except httpx.HTTPStatusError as e:
+        print(f"Error: {e}")
+
+
+if __name__ == "__main__":
+    # Run the main async function
+    asyncio.run(main()) 
