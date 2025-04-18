@@ -327,6 +327,45 @@ async def test_analyze_unsupported_language(http_client: httpx.AsyncClient):
                  break
     assert found_lang_error, f"Expected enum validation error for 'language', got: {data['detail']}"
 
+@pytest.mark.asyncio
+async def test_analyze_large_input(http_client: httpx.AsyncClient):
+    """Test the /analyze endpoint with a large code input."""
+    # Generate a large block of simple, valid Python code
+    line = "x = 1 + 1 # A comment to add some bytes\n"
+    # Aim for roughly 100KB-500KB? Let's try ~20000 lines = ~1MB
+    large_code = line * 20000 
+    language = "python"
+    
+    print(f"\nSending large code block ({len(large_code)} bytes, {large_code.count('\n')} lines) to /analyze...")
+    
+    # Use a longer timeout for this specific request
+    timeout_config = httpx.Timeout(30.0, connect=5.0) # 30 sec total timeout
+    
+    response = await http_client.post(
+        "/analyze", 
+        json={"code": large_code, "language": language},
+        timeout=timeout_config
+    )
+    
+    print(f"Received response status: {response.status_code}")
+    
+    # Primary assertion: Did it complete successfully?
+    assert response.status_code == 200, f"Expected 200 OK, got {response.status_code}"
+    
+    # Basic validation of the response structure
+    data = response.json()
+    assert "issues" in data
+    assert isinstance(data["issues"], list)
+    # We don't expect issues in this simple generated code
+    assert not data["issues"]
+    assert "formatted_code" in data
+    # Check if formatted code seems reasonable (at least not empty or error message)
+    assert isinstance(data["formatted_code"], str)
+    assert len(data["formatted_code"]) > 0
+    assert "error" not in data["formatted_code"].lower()
+    # Optional: Check if the length is roughly similar (formatting might change it slightly)
+    # assert abs(len(data["formatted_code"]) - len(large_code)) < (len(large_code) * 0.1) 
+
 # Add more tests for edge cases, different languages (if supported), auth failures, etc.
 
 # TODO: Add test for unauthorized access (missing/invalid API key)
