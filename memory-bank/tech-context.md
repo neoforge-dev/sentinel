@@ -1,48 +1,31 @@
-# Tech Context
+# Tech Context - Optimized
 
-## Technologies Used
-- **Core**: Python 3.10+, FastAPI, Pydantic, asyncio, httpx
+## Key Technologies
+- **Backend**: Python 3.10+, FastAPI, Pydantic, asyncio
 - **Testing**: pytest, pytest-asyncio, Docker
-- **Storage**: SQLite (via `DatabaseManager`)
-- **Deps**: UV
+- **Storage**: SQLite (`DatabaseManager`)
+- **Deps Mgt**: UV
+- **Comms**: httpx (client)
 - **UI**: Streamlit
-- **Dev Tools**: Black, isort, mypy
-- **CI/CD**: GitHub Actions, GHCR
+- **Lint/Format**: Ruff (via MCP Code Server), Black, isort
+- **CI/CD**: GitHub Actions
 
-## Development Setup
-- **Install**: `uv pip install -e .` (Dev mode) or `uv pip install -r requirements.txt`
-- **Run (Servers)**: `python -m agents.mcp_code_server`, `python -m agents.mcp_test_server`
-- **Run (UI)**: `streamlit run web/app.py`
-- **Ports**: Code Server = 8081, Test Server = 8082
-- **Docker**: Required for Docker test mode.
-- **Python Path**: `python -m ...` preferred over setting `PYTHONPATH`.
-- **API Key**: Set `AGENT_API_KEY` env var (default: `dev_secret_key`).
+## Development Setup & Commands
+- **Env Setup**: `uv venv`, `source .venv/bin/activate`
+- **Install Deps**: `uv pip install -r requirements.txt`
+- **Run Code Server**: `uv run python -m agents.mcp_code_server` (Port 8081)
+- **Run Test Server**: `uv run python -m agents.mcp_test_server` (Port 8082)
+- **Run UI**: `uv run streamlit run ui/app.py`
+- **Run Tests**: `make test` / `make test-integration`
+- **API Key**: Set `MCP_API_KEY` env var (default: `dev_secret_key`).
 
-## Technical Constraints / Known Issues
-- **Testing**: Requires pytest, Docker permissions (for Docker mode).
-- **Warnings**: `pytest-asyncio` fixture/loop warnings, Docker `pip as root` warnings.
-- **Docker Latency**: Docker tests are slower than local.
-
-## Core Dependencies
-- Python 3.10+, FastAPI, Docker, pytest, asyncio, httpx, pydantic, aiosqlite, requests, tenacity, colorama
-
-## Technical Debt
-- Address `pytest-asyncio` & Docker warnings.
-- Consistent logging approach.
-- Consistent error handling patterns.
-- Improve test coverage (edge cases).
-
-## Performance Considerations
-- Docker overhead.
-- Port availability (8081, 8082).
-- Concurrent test resource management.
-
-## Security Considerations
-- **Auth**: Basic API Key (enhance later?).
-- **Docker**: Run containers securely.
-- **Input Validation**: Needed for APIs.
-- **Error Reporting**: Avoid leaking sensitive info.
-
-## CI/CD Integration
-- **CI**: GitHub Actions (Lint, Test).
-- **CD**: Basic Docker image build/push to GHCR.
+## Key Constraints & Considerations
+- **Environment**: Python 3.10+, Docker required for Docker test mode.
+- **Python Path**: Use `python -m ...` or `uv run ...` for module execution.
+- **Known Issues / Tech Debt**:
+    - `pytest-asyncio` fixture/loop warnings.
+    - Docker `pip as root` build warnings.
+    - Docker test latency.
+    - Need for consistent logging/error handling patterns.
+    - Test coverage needs improvement.
+- **Security**: Basic API Key, Docker isolation needs care, Input validation required.

@@ -1,45 +1,33 @@
-# Product Context Summary
+# Product Context: NEO Agent Framework - Optimized
 
-## Problem
-Running context-aware AI agents locally is complex (LLM integration, deps, persistence, tasks).
+## Problem Area
+- Automate repetitive coding/testing tasks (analysis, format, run tests).
+- Provide project-specific context missing in generic AI.
+- Simplify cross-environment testing (local/Docker).
 
-## Solution: BaseAgent
-Integrates **Ollama**, **UV**, **MCP** (Code/Test servers), and **Communication Layer** for streamlined local agent development with local & Docker testing.
+## Solution Overview
+- Automated Developer Assistant (NEO Agent).
+- Modular MCPs:
+    - **Code MCP:** Code analysis, formatting, snippet DB.
+    - **Test MCP:** Test execution (local/Docker), results DB.
+- Persistence: SQLite.
+- Communication: Standardized Agent-MCP APIs.
 
-## Target Users
-- Developers (local/private agents)
-- Researchers (agent architectures)
-- Privacy-focused builders
-- Teams needing isolated test environments
+## Core Value
+- Efficiency (faster cycles).
+- Quality (consistent standards, reliable tests).
+- Simplicity (easier test environment management).
 
-## Key Goals
-- Simple Setup
-- Model Flexibility (Ollama)
-- Specialized Tasks (MCPs)
-- Extensibility (Plugins)
-- Isolated Testing (Docker)
-- Consistent Communication (JSON)
+## Key UX Goals
+- Simple setup/operation.
+- Clear feedback (logs, UI).
+- User control (initiate tasks via Agent/UI).
+- Transparency (view MCP operations/data).
 
-## How It Works (High Level)
-1. **Setup**: Install Ollama, UV; Clone repo; `uv pip install -r requirements.txt`.
-2. **Run**: Start MCP Servers (Code: 8081, Test: 8082); Run Agent/UI.
-3. **Interact**: Agent uses Ollama (generation) & MCPs (analysis, testing via plugins).
-4. **Testing**: MCP Test Server runs tests locally or in Docker.
-5. **Communicate**: Components use standardized JSON schemas.
-
-## Core Benefits
-- **Privacy/Cost**: Local LLM execution.
-- **Control**: Over models/agents.
-- **Specialized Tasks**: MCPs handle complex logic.
-- **Simplicity**: UV deps, FastAPI servers.
-- **Isolation**: Docker testing.
-- **Standardization**: Consistent APIs/data.
-- **Flexibility**: Local/Docker testing.
-
-## Architecture Highlights
-- **MCP Servers**: Code (8081), Test (8082).
-- **Agent Framework**: Core structure.
-- **Communication Layer**: Standardized JSON.
-- **Testing Infrastructure**: Local & Docker support.
-- **Docker Integration**: Isolated environments.
-- **Pydantic Models**: Data validation/schemas.
+## Conceptual Flow
+1.  **Request:** User -> Agent/UI (e.g., "run tests", "analyze file").
+2.  **Coordinate:** Agent -> Determines MCP.
+3.  **Execute:** Agent -> Calls MCP API (e.g., Test Server `/run-tests`).
+4.  **Process:** MCP -> Performs action (e.g., runs `pytest`).
+5.  **Feedback:** MCP -> Agent -> User (e.g., streams output, shows results).
+6.  **Persist:** MCP -> Stores data (test results, snippets).

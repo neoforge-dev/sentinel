@@ -1,38 +1,31 @@
-# Project Brief: BaseAgent
+# Project Brief: AI Agent Framework (NEO) - Optimized
 
-## Purpose
-Integrate **Ollama**, **UV**, and **MCP** (Model Context Protocol) to create context-aware local AI agents with a standardized build/test/deploy process.
+## Core Goal
+Extensible AI Agent framework (NEO) for automating coding/testing via modular MCPs.
 
-## Core Requirements
-- Use Ollama for local LLMs.
-- Use UV for Python dependencies.
-- Implement MCP Code (8081) & Test (8082) servers.
-- Agent interacts with Ollama & MCPs.
-- SQLite DB persistence for MCP servers.
-- Standardized JSON communication layer.
+## Key Components & Requirements
+*   **Core Agent:** Task planning, code generation, MCP interaction.
+*   **MCP Code Server (Port 8081):**
+    *   Analyze/format/fix code (Ruff).
+    *   Store/retrieve snippets (SQLite via `DatabaseManager`).
+*   **MCP Test Server (Port 8082):**
+    *   Execute tests (`pytest`, `unittest`, `nose2`).
+    *   Local & Docker execution.
+    *   Stream output.
+    *   Store results (SQLite via `DatabaseManager`).
+*   **Authentication:** API Key (`X-API-Key` header) for MCPs.
+*   **Testing:** Unit & Integration tests required.
+*   **CI/CD (GitHub Actions):**
+    *   CI: Lint & Test.
+    *   CD: Docker build/push (GHCR).
+*   **UI:** Basic Streamlit UI for core operations.
+*   **Dependencies:** Managed via UV (`requirements.txt`).
 
-## Goals
-- Simplify local AI agent development.
-- Provide extensible context via MCPs.
-- Easy setup & use.
-- Clear architectural boundaries.
-- Support local & Docker test execution.
+## Key Success Metrics
+*   **Stability:** Passing test suite.
+*   **Functionality:** Agent uses MCPs; UI controls basic tasks.
+*   **Modularity:** Independent MCPs via defined APIs.
 
-## Scope
-- **In**: Ollama, MCP Servers (Code, Test), Agent+Plugins, DB, CI/CD, Basic UI, Docker tests, Integration tests.
-- **Out**: Advanced orchestration, Model training, Complex UI, Prod deployment automation.
-
-## Success Criteria
-- Agent uses Ollama & MCPs.
-- MCPs perform tasks (analyze, test, store data).
-- CI/CD runs tests & builds images.
-- Basic UI works.
-- Setup via `uv pip install -r requirements.txt`.
-- Tests pass locally & in Docker.
-- Integration tests verify component interaction.
-
-## Current Status
-- Core functionality operational.
-- MCP servers running on standard ports (8081, 8082).
-- Local & Docker test modes working.
-- Focus: Stabilizing tests, resolving warnings.
+## Key Non-Functional Requirements
+*   Extensibility (new tools/MCPs).
+*   Security (API key).
