@@ -79,7 +79,7 @@ This project utilizes specialized MCP servers for different backend tasks. They 
 - **Purpose**: Handles code analysis (linting), formatting, auto-fixing (using Ruff for Python), and storing/retrieving code snippets.
 - **Run**: 
   ```bash
-  python agents/mcp_code_server.py
+  uv run python -m agents.mcp_code_server
   ```
 - **Default Port**: 8081 (Configurable via `MCP_CODE_PORT` env var)
 - **Key Endpoints**:
@@ -107,44 +107,5 @@ The `MCPEnhancedAgent` (`src/mcp_enhanced_agent.py`) provides a unified Python i
 To see it in action, first start both MCP servers (see above), then run the demo script:
 
 ```bash
-python examples/mcp_enhanced_agent_demo.py
-```
-
-This demo will:
-1.  Analyze sample code using the Code Server.
-2.  Attempt to fix the sample code using the Code Server.
-3.  Run sample tests located in `tests/test_sample` using the Test Server.
-4.  Display the results and analysis from both servers.
-
-### Using the Agent or Servers Directly
-
-- You can integrate the `MCPEnhancedAgent` into your own applications.
-- You can interact with the MCP servers directly via HTTP requests (see client examples in `examples/` and the server API docs).
-
-## Development
-
-- **Running servers with auto-reload**:
-The `uvicorn.run` command in the server scripts includes `reload=True` by default for development.
-- **Database**: The SQLite database is stored at `data/mcp.db`. You can inspect it using tools like DB Browser for SQLite.
-
-## Troubleshooting
-
-- **Server Connection Issues**: Ensure the respective MCP servers are running. Check the host and port configured in your client or the `.env` file (defaults are `localhost:8081` for code, `localhost:8082` for test).
-- **`ruff` not found**: Make sure `ruff` is installed (`uv pip install ruff` or `pip install ruff`) and accessible in your PATH.
-- **Database Errors**: If you encounter issues, you can try deleting the `data/mcp.db` file. The servers will recreate it on startup.
-- **Docker Test Errors**: Ensure Docker Desktop (or Docker Engine) is running if you are using the 'docker' mode for the test server.
-- **Weather Tool Errors**: The `mcp_enhanced_agent_demo.py` uses a weather tool (`tools/weather_tool.py`) that requires an API key from [OpenWeatherMap](https://openweathermap.org/appid). Sign up for a free key and set the `OPENWEATHERMAP_API_KEY` environment variable.
-
-## License
-
-MIT License
-
-```bash
-export MCP_API_KEY="your-secret-key"
-export MCP_CODE_SERVER_URL="http://localhost:8081"
-export MCP_TEST_SERVER_URL="http://localhost:8082"
-ollama serve &
-./run_mcp_server.sh --server code &
-./run_mcp_server.sh --server test &
-streamlit run ui/app.py
+uv run python examples/mcp_enhanced_agent_demo.py
 ```

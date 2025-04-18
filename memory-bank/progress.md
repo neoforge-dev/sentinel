@@ -26,11 +26,11 @@
     - Improve test coverage (edge cases).
 - **Low Priority / Future:**
     - Advanced context filtering / management.
-    - Agent templating.
-    - Performance benchmarks.
+- Agent templating.
+- Performance benchmarks.
     - Automated deployment beyond image push.
     - Client-side error handling (circuit breaking?).
-    - CLI improvements.
+- CLI improvements.
     - Multi-model support.
 
 ## Known Issues

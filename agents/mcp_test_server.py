@@ -395,7 +395,8 @@ def extract_test_summary(output: str, runner: Optional[RunnerType] = None) -> st
     # Default/Pytest patterns
     # Priority 1: Look for "short test summary info" block
     # Updated regex to capture content between short summary header and the final summary line or end of string.
-    short_summary_pattern_str = r"^=+\s+short test summary info\s+=+$\n(.*?)(?=\n^=+(?:\s*\d+\s+(?:failed|passed|skipped|errors?)|\s*warnings summary|\s*error\s*)=+|^\Z)" # Raw string for regex, stop before final summary/warnings/errors
+    short_summary_pattern_str = r"^=+\s+short test summary info\s+=+$\n(.*?)(?=\n^=+(?:\s*\d+\s+(?:failed|passed|skipped|errors?)|\s*warnings summary|\s*error\s*)=+|^\Z)"
+    # Raw string for regex, stop before final summary/warnings/errors
     short_match = re.search(short_summary_pattern_str, output, re.DOTALL | re.MULTILINE | re.IGNORECASE)
     if short_match:
         short_summary_content = short_match.group(1).strip()
@@ -408,8 +409,8 @@ def extract_test_summary(output: str, runner: Optional[RunnerType] = None) -> st
             # Continue to next pattern if short summary is empty
 
     # Priority 2: Look for the final summary line (e.g., === ... passed ... in ...s ===)
-    # Original regex seems okay, ensure it captures the whole line.
-    final_summary_pattern_str = r"(^={10,}\s*(?:\d+\s+)?(?:failed|passed|skipped|errors?|warnings|selected).*?in\s+[\d\.]+s.*?={10,}$)" # Raw string, adjusted slightly for flexibility
+    # Reverted to original raw string definition
+    final_summary_pattern_str = r"(^={10,}\s*(?:\d+\s+)?(?:failed|passed|skipped|errors?|warnings|selected).*?in\s+[\d\.]+s.*?={10,}$)"
     final_match = re.search(final_summary_pattern_str, output, re.MULTILINE | re.IGNORECASE)
     if final_match:
         final_summary_line = final_match.group(1).strip()
@@ -885,7 +886,7 @@ async def run_tests_local(config: ExecutionConfig, db: DatabaseManager) -> Union
                  execution_time=result_data.execution_time, config=config.model_dump()
             )
             logger.info(f"Stored test result with ID: {result_data.id} and status: {result_data.status}")
-            return result_data # Return the final data object
+            return result_data
             
     except Exception as e:
          logger.error(f"Configuration error for local execution: {e}", exc_info=True)
@@ -959,84 +960,93 @@ async def get_last_failed_tests(project_path: str, db: DatabaseManager = Depends
 @app.post("/run-tests", response_model=None)
 async def run_tests_endpoint(
     config: ExecutionConfig,
-    background_tasks: BackgroundTasks, # Keep for potential future background work
-    db: DatabaseManager = Depends(get_request_db_manager), # Use request-scoped DB
-    api_key: str = Depends(verify_api_key) # Security dependency
-) -> Union[ResultData, StreamingResponse]: # Re-adding return type hint for clarity
-    """Endpoint to trigger test execution (local or potentially docker)."""
+    background_tasks: BackgroundTasks, 
+    db: DatabaseManager = Depends(get_request_db_manager),
+    api_key: str = Depends(verify_api_key)
+):
+    """Endpoint to trigger test execution (local or docker)."""
     logger.info(f"Received request to run tests: Mode={config.mode.value}, Path={config.test_path}, Stream={config.stream_output}")
     
-    # Currently, only local execution is fully implemented and tested here.
-    # Docker execution logic seems missing or was refactored out.
-    if config.mode == ExecutionMode.DOCKER:
-        logger.warning("Docker execution mode selected, but not implemented in this endpoint. Falling back to local.")
-        # raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Docker execution mode not implemented yet.")
-        # For now, we can proceed with local execution or explicitly block.
-        # Let's proceed with local for now to allow testing the flow.
-        pass # Allowing fallback to local for now
+    execution_func = None
+    if config.mode == ExecutionMode.LOCAL:
+        execution_func = run_tests_local
+    elif config.mode == ExecutionMode.DOCKER:
+        execution_func = run_tests_docker
+    else:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unsupported execution mode: {config.mode.value}")
 
     try:
-        # Call the appropriate execution function
-        # Since run_tests_docker was removed, we only have run_tests_local
-        result_or_stream = await run_tests_local(config=config, db=db)
+        result_or_stream = await execution_func(config=config, db=db)
 
         if config.stream_output:
-            # Ensure it's an async generator before creating StreamingResponse
+            # Expecting an AsyncGenerator
             if inspect.isasyncgen(result_or_stream):
-                # Define a generator that yields text chunks for the stream
                 async def stream_wrapper():
                     try:
                         async for chunk in result_or_stream:
-                            yield f"{chunk}\n" # Add newline for client readability
+                            yield f"{chunk}\n"
                     except Exception as stream_err:
-                        logger.error(f"Error during stream generation: {stream_err}", exc_info=True)
+                        logger.error(f"Error during stream generation wrapper: {stream_err}", exc_info=True)
                         yield f"STREAM_ERROR: {stream_err}\n"
-                
                 return StreamingResponse(stream_wrapper(), media_type="text/plain")
             else:
-                # Handle case where streaming was requested but local func returned ResultData (e.g., config error)
+                # This case should ideally not happen if error paths return generators
                 logger.error(f"Streaming requested but received non-generator: {type(result_or_stream)}")
-                # Re-raise or return an error response. For simplicity, return the data.
-                # This path might indicate an issue in run_tests_local error handling for streams.
+                detail = "Internal server error: Streaming failed unexpectedly."
                 if isinstance(result_or_stream, ResultData):
-                     # This shouldn't happen ideally if run_tests_local handles streaming errors correctly
-                     # Return a 500 error as this indicates an internal inconsistency
-                      raise HTTPException(status_code=500, detail="Internal server error: Streaming failed unexpectedly.")
-                else:
-                     # Unknown type returned
-                      raise HTTPException(status_code=500, detail="Internal server error: Unexpected type returned for stream.")
-
+                    detail += f" (Got ResultData: Status={result_or_stream.status})"
+                raise HTTPException(status_code=500, detail=detail)
         else:
-            # Non-streaming: Ensure we got ResultData
+            # Non-streaming: Expecting ResultData OR an AsyncGenerator (if config error occurred)
             if isinstance(result_or_stream, ResultData):
+                # Success case for non-streaming
                 return result_or_stream
-            else:
-                # Handle unexpected generator return in non-streaming mode
-                logger.error(f"Non-streaming requested but received generator: {type(result_or_stream)}")
-                # Consume generator to get the result if possible (might be error state)
-                final_result = None
+            elif inspect.isasyncgen(result_or_stream):
+                # Config error case occurred, execution func returned error generator
+                logger.warning("Execution function returned generator in non-streaming mode (likely config error).")
+                error_details = []
                 try:
-                    async for item in result_or_stream:
-                         if isinstance(item, ResultData): # Assuming the generator might yield ResultData at the end
-                              final_result = item
-                              break
-                    if final_result:
-                         return final_result
-                    else:
-                         raise HTTPException(status_code=500, detail="Internal server error: Failed to get result from generator.")
+                    async for error_chunk in result_or_stream:
+                        error_details.append(str(error_chunk).strip())
                 except Exception as e:
-                     logger.exception("Error consuming unexpected generator in non-streaming mode")
-                     raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+                    logger.error(f"Error consuming error generator: {e}", exc_info=True)
+                # Return a 500 error indicating the underlying configuration issue
+                raise HTTPException(status_code=500, detail=f"Execution failed during setup: {' '.join(error_details)}")
+            else:
+                # Unexpected return type
+                logger.error(f"Unexpected return type in non-streaming mode: {type(result_or_stream)}")
+                raise HTTPException(status_code=500, detail="Internal server error: Unexpected execution result type.")
 
-    except ValueError as ve:
+    except ValueError as ve: # Catch config errors raised *before* calling execution_func
         logger.warning(f"Configuration validation error in /run-tests: {ve}")
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(ve))
     except HTTPException as he:
-        # Re-raise HTTP exceptions from dependencies (like auth)
         raise he
     except Exception as e:
         logger.exception("Unexpected error in /run-tests endpoint")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {e}")
+
+
+# TODO: Extract Docker streaming logic into a dedicated async generator
+async def generate_docker_stream(config: ExecutionConfig, db: DatabaseManager) -> AsyncGenerator[str, None]:
+    """Move the streaming branch logic from run_tests_docker here."""
+    # TODO: Implement streaming execution here
+    raise NotImplementedError("generate_docker_stream is not yet implemented")
+
+
+# TODO: Extract Docker non-streaming logic into a dedicated function
+async def run_tests_docker_non_stream(config: ExecutionConfig, db: DatabaseManager) -> ResultData:
+    """Move the non-streaming Docker logic from run_tests_docker here."""
+    # TODO: Implement non-streaming execution here
+    raise NotImplementedError("run_tests_docker_non_stream is not yet implemented")
+
+
+# --- Refactored dispatcher for Docker execution ---
+async def run_tests_docker(config: ExecutionConfig, db: DatabaseManager) -> Union[ResultData, AsyncGenerator[str, None]]:
+    """Dispatch to streaming or non-streaming Docker handlers based on config.stream_output."""
+    if config.stream_output:
+        return generate_docker_stream(config, db)
+    return await run_tests_docker_non_stream(config, db)
 
 
 def main():
