@@ -298,6 +298,35 @@ async def test_unauthorized_access(code_server_process):
         )
         assert response_post_invalid_key.status_code == 403
 
+@pytest.mark.asyncio
+async def test_analyze_unsupported_language(http_client: httpx.AsyncClient):
+    """Test the /analyze endpoint with an unsupported language."""
+    code = "DISPLAY 'Hello, COBOL!'"
+    language = "cobol" # Assuming COBOL is not supported
+    response = await http_client.post("/analyze", json={"code": code, "language": language})
+    
+    # Expect a client error (4xx). Common choices:
+    # 400 Bad Request: If the server considers the language invalid input.
+    # 422 Unprocessable Entity: If input structure is valid but semantics (language) are wrong.
+    # 501 Not Implemented: If the endpoint exists but can't handle this specific request.
+    # Let's check for 400 or 422 first.
+    assert response.status_code in [400, 422], f"Expected 400 or 422, got {response.status_code}"
+    
+    data = response.json()
+    assert "detail" in data
+    # Check the detail structure for a validation error related to language
+    assert isinstance(data["detail"], list), "Expected detail to be a list for 422 errors"
+    found_lang_error = False
+    for error in data["detail"]:
+        if isinstance(error, dict):
+            # Check if it's an enum validation error for the 'language' field
+            is_enum_error = error.get("type") == "enum"
+            is_language_loc = any("language" == str(loc) for loc in error.get("loc", []))
+            if is_enum_error and is_language_loc:
+                 found_lang_error = True
+                 break
+    assert found_lang_error, f"Expected enum validation error for 'language', got: {data['detail']}"
+
 # Add more tests for edge cases, different languages (if supported), auth failures, etc.
 
 # TODO: Add test for unauthorized access (missing/invalid API key)
