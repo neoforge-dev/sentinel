@@ -18,8 +18,7 @@ async def test_root_endpoint(test_server_process):
         response = await client.get("/")
         assert response.status_code == 200
         data = response.json()
-        assert data.get("service") == "MCP Test Server"
-        assert data.get("status") == "active"
+        assert data.get("message") == "MCP Test Server is running"
 
 @pytest.mark.asyncio
 async def test_run_local_success(test_server_process, sample_project_path):

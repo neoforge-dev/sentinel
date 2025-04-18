@@ -149,7 +149,14 @@ async def analyze_python_code(code: str, filename: Optional[str] = None) -> Code
         
         if check_result.stdout:
             try:
-                issues = json.loads(check_result.stdout)
+                parsed_output = json.loads(check_result.stdout)
+                # Ensure parsed_output is a list, even if ruff returns null or other JSON
+                if isinstance(parsed_output, list):
+                    issues = parsed_output
+                else:
+                    logger.warning(f"Ruff check JSON output was not a list: {parsed_output}")
+                    # Decide handling: empty list or specific error?
+                    issues = [] # Default to empty list if not a list of issues
             except json.JSONDecodeError as e:
                 logger.error(f"Error parsing ruff check output: {e}")
                 logger.error(f"Ruff check stdout: {check_result.stdout}")
@@ -157,6 +164,7 @@ async def analyze_python_code(code: str, filename: Optional[str] = None) -> Code
         elif check_result.stderr:
              logger.error(f"Ruff check error: {check_result.stderr}")
              issues = [{"code": "MCP502", "message": f"Ruff check failed: {check_result.stderr[:100]}...", "location": {"row": 1, "column": 1}}]
+        # If stdout/stderr are empty, issues remains []
 
         # 2. Run ruff format separately
         # Rerun on the original code to ensure formatting is clean
@@ -184,10 +192,19 @@ async def analyze_python_code(code: str, filename: Optional[str] = None) -> Code
             error_message = format_result.stderr or f"Ruff format exited with code {format_result.returncode}"
             logger.warning(f"Ruff format failed: {error_message}")
             # Add the specific MCP504 issue
+            # Ensure issues is a list before appending
+            if not isinstance(issues, list):
+                logger.warning(f"'issues' was not a list ({type(issues)}) before appending MCP504. Resetting.")
+                issues = []
             issues.append({"code": "MCP504", "message": f"Ruff format failed (likely syntax error): {error_message[:200]}...", "location": {"row": 1, "column": 1}})
             # Ensure original code is returned as formatted_code
             formatted_code = code
 
+        # Final check: Ensure issues is always a list
+        if not isinstance(issues, list):
+            logger.error(f"Final 'issues' is not a list ({type(issues)}), resetting to empty list.")
+            issues = []
+            
         return CodeAnalysisResult(issues=issues, formatted_code=formatted_code)
     
     except Exception as e:

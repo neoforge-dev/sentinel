@@ -350,12 +350,12 @@ class DatabaseManager:
         if not self.conn:
             await self.connect()
         
-        # Select all columns necessary to build ResultData
+        # Select columns needed, including the config blob
         query = """
             SELECT 
-                id, project_path, test_path, runner, execution_mode, status, 
-                summary, details, passed_tests, failed_tests, skipped_tests, 
-                execution_time, created_at
+                id, status, summary, details, 
+                passed_tests, failed_tests, skipped_tests, 
+                execution_time, created_at, config 
             FROM test_results
             ORDER BY created_at DESC
             LIMIT ?
@@ -368,14 +368,47 @@ class DatabaseManager:
                 columns = [description[0] for description in cursor.description]
                 for row in rows:
                     result_dict = dict(zip(columns, row))
+                    
                     # Deserialize JSON fields
                     result_dict['passed_tests'] = json.loads(result_dict.get('passed_tests', '[]'))
                     result_dict['failed_tests'] = json.loads(result_dict.get('failed_tests', '[]'))
                     result_dict['skipped_tests'] = json.loads(result_dict.get('skipped_tests', '[]'))
-                    # Optionally parse config if needed later, though not directly in ResultData
-                    # result_dict['config'] = json.loads(result_dict.get('config', '{}'))
-                    # Convert timestamp string back to datetime object if needed (or handle in Pydantic)
-                    # result_dict['created_at'] = datetime.fromisoformat(result_dict['created_at'])
+                    
+                    # Deserialize config and extract required fields
+                    config_data = {}
+                    config_json = result_dict.get('config', '{}')
+                    try:
+                        config_data = json.loads(config_json) if config_json else {}
+                    except json.JSONDecodeError:
+                        logger.warning(f"Failed to decode config JSON for result {result_dict.get('id')}: {config_json}")
+
+                    result_dict['project_path'] = config_data.get('project_path')
+                    result_dict['test_path'] = config_data.get('test_path')
+                    result_dict['runner'] = config_data.get('runner')
+                    result_dict['execution_mode'] = config_data.get('mode') # Map config 'mode'
+                    
+                    # Remove the raw config blob if not needed downstream (optional)
+                    # result_dict.pop('config', None) 
+                    
+                    # Convert created_at to datetime object (handle string or timestamp)
+                    created_at_val = result_dict.get("created_at")
+                    if isinstance(created_at_val, str):
+                        try:
+                            result_dict["created_at"] = datetime.fromisoformat(created_at_val.replace("Z", "+00:00"))
+                        except ValueError:
+                             try:
+                                 # Fallback for common format without microseconds or TZ
+                                 result_dict["created_at"] = datetime.strptime(created_at_val, "%Y-%m-%d %H:%M:%S")
+                             except ValueError:
+                                  logger.warning(f"Could not parse created_at string: {created_at_val} for result {result_dict.get('id')}")
+                                  # Set a default or let Pydantic handle potential error
+                                  result_dict["created_at"] = datetime.now() # Example fallback
+                    elif isinstance(created_at_val, (int, float)):
+                        result_dict["created_at"] = datetime.fromtimestamp(created_at_val)
+                    elif not isinstance(created_at_val, datetime):
+                         logger.warning(f"Unexpected type for created_at: {type(created_at_val)} for result {result_dict.get('id')}")
+                         result_dict["created_at"] = datetime.now() # Example fallback
+                         
                     results.append(result_dict)
         except Exception as e:
             logger.error(f"Error listing test results: {e}", exc_info=True)

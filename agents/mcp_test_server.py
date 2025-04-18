@@ -252,7 +252,6 @@ def extract_test_results(output: str, runner: RunnerType) -> Dict[str, List[str]
         "skipped": []
     }
     
-    # Runner-specific parsing
     if runner in [RunnerType.UNITTEST, RunnerType.NOSE2]:
         # Pattern for unittest/nose2 style: test_method (module.class) ... ok/FAIL/ERROR/SKIP
         pattern = re.compile(r"^(test_\w+)\s+\((.*?)\)\s+\.\.\.\s+(\w+)", re.MULTILINE)
@@ -325,45 +324,61 @@ def extract_test_results(output: str, runner: RunnerType) -> Dict[str, List[str]
                  results["failed"].append("Unknown test (failure detected in summary)")
 
     else: # Default to pytest style parsing
-        # Regex to capture pytest test result lines
         pattern = re.compile(r"^([^\s]+\.py(?:[:]{2}[^\s]+)?)\s(PASSED|FAILED|SKIPPED|ERROR|XFAIL|XPASS)\s*(?:\[\s*\d+%\s*\])?$", re.MULTILINE)
+        processed_tests: Set[str] = set()
 
         for match in pattern.finditer(output):
             test_name = match.group(1)
             status = match.group(2)
+            if test_name in processed_tests: continue
+            processed_tests.add(test_name)
+            if status == 'PASSED' or status == 'XPASS':
+                 if test_name not in results["passed"]: results["passed"].append(test_name)
+            elif status == 'FAILED' or status == 'ERROR':
+                 if test_name not in results["failed"]: results["failed"].append(test_name)
+            elif status == 'SKIPPED' or status == 'XFAIL':
+                if test_name not in results["skipped"]: results["skipped"].append(test_name)
 
-            if status == 'PASSED' or status == 'XPASS': # Treat XPASS as pass
-                if test_name not in results["passed"]:
-                    results["passed"].append(test_name)
-            elif status == 'FAILED' or status == 'ERROR': # Group ERROR with FAILED
-                 if test_name not in results["failed"]:
-                    results["failed"].append(test_name)
-            elif status == 'SKIPPED' or status == 'XFAIL': # Group XFAIL with SKIPPED
-                if test_name not in results["skipped"]:
-                    results["skipped"].append(test_name)
-
-        # Fallback: Also check the final summary line for resilience
         for line in output.split('\n'):
-            if 'FAILED' in line and '.py::' in line:
-                test_name_match = re.search(r'([^\s]+\.py::[^\s]+)', line)
-                if test_name_match:
-                    test_name = test_name_match.group(1)
-                    if test_name not in results["failed"]:
-                         results["failed"].append(test_name)
-            elif 'PASSED' in line and '.py::' in line:
-                test_name_match = re.search(r'([^\s]+\.py::[^\s]+)', line)
-                if test_name_match:
-                    test_name = test_name_match.group(1)
-                    if test_name not in results["passed"]:
-                        results["passed"].append(test_name)
+             if 'FAILED' in line and '.py::' in line:
+                 test_name_match = re.search(r'([^\s]+\.py::[^\s]+)', line)
+                 if test_name_match:
+                     test_name = test_name_match.group(1)
+                     if test_name not in results["failed"] and test_name not in processed_tests:
+                          results["failed"].append(test_name)
+                          processed_tests.add(test_name)
+             elif 'PASSED' in line and '.py::' in line:
+                 test_name_match = re.search(r'([^\s]+\.py::[^\s]+)', line)
+                 if test_name_match:
+                     test_name = test_name_match.group(1)
+                     if test_name not in results["passed"] and test_name not in processed_tests:
+                         results["passed"].append(test_name)
+                         processed_tests.add(test_name)
 
+        # <<< Fallback 2 using string manipulation >>>
+        if not results["passed"]:
+            for line in output.split('\n'):
+                stripped_line = line.strip()
+                if stripped_line.endswith("%]"):
+                    open_bracket_pos = stripped_line.rfind('[')
+                    if open_bracket_pos != -1:
+                         stripped_line = stripped_line[:open_bracket_pos].strip()
+                if stripped_line.endswith(" .") and '.py' in stripped_line:
+                    parts = stripped_line.split()
+                    if len(parts) >= 2 and parts[0].endswith('.py'):
+                        filepath = parts[0]
+                        test_name = filepath + "::UnknownPass"
+                        if test_name not in processed_tests:
+                            logger.debug(f"Found potential pass via simple fallback: {test_name}")
+                            results["passed"].append(test_name)
+                            processed_tests.add(test_name)
+                            
     return results
 
 
 def extract_test_summary(output: str, runner: Optional[RunnerType] = None) -> str:
-    """Extract the test summary from the output, prioritizing the final summary line."""
+    """Extract the test summary from the output, prioritizing the most informative block."""
     
-    # Specific patterns for unittest/nose2
     if runner in [RunnerType.UNITTEST, RunnerType.NOSE2]:
         # Look for the "Ran X tests..." line and the outcome (OK, FAILED)
         summary_match = re.search(r"^(Ran \d+ tests? in .*?s)\s*^([A-Z]+(?:\s*\(.*\))?)?", output, re.MULTILINE | re.DOTALL)
@@ -378,46 +393,39 @@ def extract_test_summary(output: str, runner: Optional[RunnerType] = None) -> st
         return "\n".join(lines[-5:])
 
     # Default/Pytest patterns
-    # Priority 1: Look for the final summary line
-    # Simplified pattern, focuses on structure: === ... (passed/failed/etc) ... in ...s ===
-    final_summary_pattern = r'(^={10,}.*(?:passed|failed|skipped|error|warnings|selected).*in\s+[\d\.]+s.*={10,}$)'
-    match = re.search(final_summary_pattern, output, re.MULTILINE | re.IGNORECASE)
-    if match:
-        return match.group(1).strip() # Return the matched line
+    # Priority 1: Look for "short test summary info" block
+    short_summary_pattern_str = r"^=+\\s+short test summary info\\s+=+$\\n(.*?)(?=\\n^=+\\s*(?:\\d+ passed|\\d+ failed|\\d+ skipped|error|warnings|selected)|\\Z)" # Raw string for regex
+    short_match = re.search(short_summary_pattern_str, output, re.DOTALL | re.MULTILINE | re.IGNORECASE)
+    if short_match:
+        short_summary_content = short_match.group(1).strip()
+        logger.debug("Found and using 'short test summary info' block.")
+        return short_summary_content # Always return this block if found
 
-    # Priority 2: Look for short summary lines (often near the end)
-    # Corrected the lookahead group to handle potential final === line
-    short_summary_pattern = r"^=+\s+short test summary info\s+=+$\n(.*?)(?=\n^=+\s*(?:\d+ passed|\d+ failed|\d+ skipped|error|warnings|selected)|\Z)" 
-    match = re.search(short_summary_pattern, output, re.DOTALL | re.MULTILINE | re.IGNORECASE)
-    if match:
-        summary_content = match.group(1).strip()
-        summary_lines = summary_content.split('\n')
-        # Filter out empty lines that might result from splitting
-        non_empty_lines = [line for line in summary_lines if line.strip()]
-        # Return the first few non-empty lines of this block
-        return "\n".join(non_empty_lines[:5]) 
+    # Priority 2: Look for the final summary line (e.g., === ... passed ... in ...s ===)
+    final_summary_pattern_str = r"(^={10,}.*(?:passed|failed|skipped|error|warnings|selected).*in\\s+[\\d\\.]+s.*={10,}$)" # Raw string
+    final_match = re.search(final_summary_pattern_str, output, re.MULTILINE | re.IGNORECASE)
+    if final_match:
+        final_summary_line = final_match.group(1).strip()
+        logger.debug("Using final summary line as no short summary block found.")
+        return final_summary_line
 
-    # Fallback: If no specific summary line/block is found, return the last few lines.
-    # Avoid returning the full FAILURES/ERRORS block explicitly.
+    # Generic Fallback: Last few lines if nothing else matched
+    logger.debug("No specific summary block found, falling back to last lines.")
     lines = output.strip().split("\n")
-    # Look for the start of the last block of === lines, but avoid the main FAILURES/ERRORS section
-    # Find the last line that starts with ====
+    # Find the last line that starts with ====, avoiding FAILURES/ERRORS block header
     last_separator_index = -1
     for i in range(len(lines) - 1, -1, -1):
         if lines[i].startswith("===="):
-            # Ensure it's not the start of the main FAILURES/ERRORS block
-            if not re.match(r"^===+\s+(FAILURES|ERRORS)\s+===+$", lines[i], re.IGNORECASE):
+             # Escaped pattern string
+            if not re.match(r"^===+\\s+(FAILURES|ERRORS)\\s+===+$", lines[i], re.IGNORECASE):
                 last_separator_index = i
                 break 
                 
     if last_separator_index != -1:
-        # Return lines from the last relevant separator onwards
         return "\n".join(lines[last_separator_index:])
     elif len(lines) > 5:
-        # Generic fallback to last 5 lines if no suitable separator found
         return "\n".join(lines[-5:])
     else:
-        # If very short output, return it all
         return output.strip()
 
 
