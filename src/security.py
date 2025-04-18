@@ -22,7 +22,7 @@ async def verify_api_key(api_key_header: str = Security(API_KEY_HEADER)):
         )
     if api_key_header != EXPECTED_API_KEY:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
+            status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid API Key",
         )
     # If the key is valid, the function returns None implicitly, allowing access

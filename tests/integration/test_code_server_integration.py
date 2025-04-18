@@ -265,6 +265,39 @@ async def test_format_invalid_syntax(http_client: httpx.AsyncClient):
     # Check if detail mentions syntax error or formatting failure
     assert "syntax error" in data["detail"].lower() or "formatting failed" in data["detail"].lower()
 
+@pytest.mark.asyncio
+async def test_unauthorized_access(code_server_process):
+    """Test accessing endpoints without a valid API key."""
+    # Create a client *without* the default auth headers
+    async with httpx.AsyncClient(base_url=BASE_URL, timeout=30.0) as client:
+        # Test root endpoint without key - Should be 401 (Authentication required)
+        response_no_key = await client.get("/")
+        assert response_no_key.status_code == 401, "Expected 401 Unauthorized when no API key is provided"
+        data_no_key = response_no_key.json()
+        assert "detail" in data_no_key
+        # Update: Check for the specific message observed in the logs
+        assert "missing api key" in data_no_key["detail"].lower()
+
+        # Test root endpoint with invalid key - Should be 403 (Forbidden after failed validation)
+        response_invalid_key = await client.get("/", headers={"X-API-Key": "invalid-key"})
+        assert response_invalid_key.status_code == 403, "Expected 403 Forbidden when an invalid API key is provided"
+        data_invalid_key = response_invalid_key.json()
+        assert "detail" in data_invalid_key
+        # Our verify_api_key function raises HTTPException with 'Invalid API Key'
+        assert "invalid api key" in data_invalid_key["detail"].lower()
+
+        # Test a POST endpoint (e.g., analyze) without key - Should be 401
+        response_post_no_key = await client.post("/analyze", json={"code": "print('test')", "language": "python"})
+        assert response_post_no_key.status_code == 401
+
+        # Test a POST endpoint with invalid key - Should be 403
+        response_post_invalid_key = await client.post(
+            "/analyze", 
+            json={"code": "print('test')", "language": "python"},
+            headers={"X-API-Key": "invalid-key"}
+        )
+        assert response_post_invalid_key.status_code == 403
+
 # Add more tests for edge cases, different languages (if supported), auth failures, etc.
 
 # TODO: Add test for unauthorized access (missing/invalid API key)
