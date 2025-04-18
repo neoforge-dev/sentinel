@@ -394,33 +394,40 @@ def extract_test_summary(output: str, runner: Optional[RunnerType] = None) -> st
 
     # Default/Pytest patterns
     # Priority 1: Look for "short test summary info" block
-    short_summary_pattern_str = r"^=+\\s+short test summary info\\s+=+$\\n(.*?)(?=\\n^=+\\s*(?:\\d+ passed|\\d+ failed|\\d+ skipped|error|warnings|selected)|\\Z)" # Raw string for regex
+    # Updated regex to capture content between short summary header and the final summary line or end of string.
+    short_summary_pattern_str = r"^=+\s+short test summary info\s+=+$\n(.*?)(?=\n^=+(?:\s*\d+\s+(?:failed|passed|skipped|errors?)|\s*warnings summary|\s*error\s*)=+|^\Z)" # Raw string for regex, stop before final summary/warnings/errors
     short_match = re.search(short_summary_pattern_str, output, re.DOTALL | re.MULTILINE | re.IGNORECASE)
     if short_match:
         short_summary_content = short_match.group(1).strip()
-        logger.debug("Found and using 'short test summary info' block.")
-        return short_summary_content # Always return this block if found
+        # Ensure we don't just return an empty string if the block is empty
+        if short_summary_content:
+            logger.debug("Found and using 'short test summary info' block.")
+            return short_summary_content
+        else:
+            logger.debug("'short test summary info' block found but was empty, continuing search.")
+            # Continue to next pattern if short summary is empty
 
     # Priority 2: Look for the final summary line (e.g., === ... passed ... in ...s ===)
-    final_summary_pattern_str = r"(^={10,}.*(?:passed|failed|skipped|error|warnings|selected).*in\\s+[\\d\\.]+s.*={10,}$)" # Raw string
+    # Original regex seems okay, ensure it captures the whole line.
+    final_summary_pattern_str = r"(^={10,}\s*(?:\d+\s+)?(?:failed|passed|skipped|errors?|warnings|selected).*?in\s+[\d\.]+s.*?={10,}$)" # Raw string, adjusted slightly for flexibility
     final_match = re.search(final_summary_pattern_str, output, re.MULTILINE | re.IGNORECASE)
     if final_match:
         final_summary_line = final_match.group(1).strip()
-        logger.debug("Using final summary line as no short summary block found.")
+        logger.debug("Using final summary line as no (non-empty) short summary block found.")
         return final_summary_line
 
     # Generic Fallback: Last few lines if nothing else matched
-    logger.debug("No specific summary block found, falling back to last lines.")
+    logger.debug("No specific summary block or final summary line found, falling back to last lines.")
     lines = output.strip().split("\n")
     # Find the last line that starts with ====, avoiding FAILURES/ERRORS block header
     last_separator_index = -1
     for i in range(len(lines) - 1, -1, -1):
         if lines[i].startswith("===="):
              # Escaped pattern string
-            if not re.match(r"^===+\\s+(FAILURES|ERRORS)\\s+===+$", lines[i], re.IGNORECASE):
+            if not re.match(r"^===+\s+(FAILURES|ERRORS)\s+===+$", lines[i], re.IGNORECASE):
                 last_separator_index = i
-                break 
-                
+                break
+
     if last_separator_index != -1:
         return "\n".join(lines[last_separator_index:])
     elif len(lines) > 5:
