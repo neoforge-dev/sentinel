@@ -366,6 +366,51 @@ async def test_analyze_large_input(http_client: httpx.AsyncClient):
     # Optional: Check if the length is roughly similar (formatting might change it slightly)
     # assert abs(len(data["formatted_code"]) - len(large_code)) < (len(large_code) * 0.1) 
 
+@pytest.mark.asyncio
+async def test_analyze_concurrency(http_client: httpx.AsyncClient):
+    """Test basic concurrency by sending multiple /analyze requests."""
+    code = "a = 1\nb = 2\nprint(a+b)"
+    language = "python"
+    num_requests = 10 # Number of concurrent requests
+
+    print(f"\nSending {num_requests} concurrent requests to /analyze...")
+
+    async def make_request():
+        # Use a separate timeout instance per request if needed, or rely on client default
+        try:
+            response = await http_client.post("/analyze", json={"code": code, "language": language})
+            # Optional: Basic check within the coroutine
+            # response.raise_for_status() 
+            return response
+        except Exception as e:
+            print(f"Error during concurrent request: {e}")
+            return None # Indicate failure
+
+    # Create tasks for concurrent execution
+    tasks = [make_request() for _ in range(num_requests)]
+    
+    # Run tasks concurrently
+    responses = await asyncio.gather(*tasks)
+    
+    print(f"Received {len(responses)} responses.")
+    
+    # Assert that all requests were successful
+    successful_responses = 0
+    for i, response in enumerate(responses):
+        assert response is not None, f"Request {i+1} failed (returned None)"
+        assert response.status_code == 200, f"Request {i+1} failed with status {response.status_code}"
+        if response.status_code == 200:
+             successful_responses += 1
+             # Optional: Basic validation of response structure
+             # try:
+             #     data = response.json()
+             #     assert "issues" in data and "formatted_code" in data
+             # except Exception as json_err:
+             #     pytest.fail(f"Request {i+1} response JSON parsing failed: {json_err}")
+
+    assert successful_responses == num_requests, f"Expected {num_requests} successful responses, got {successful_responses}"
+    print(f"All {num_requests} concurrent requests completed successfully.")
+
 # Add more tests for edge cases, different languages (if supported), auth failures, etc.
 
 # TODO: Add test for unauthorized access (missing/invalid API key)
